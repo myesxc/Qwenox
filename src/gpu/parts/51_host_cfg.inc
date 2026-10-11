@@ -2413,6 +2413,34 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     }
     std::sort(cuts.begin(), cuts.end());
     cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    // aggr 10-12: an earlier cut costs its own prefill_batch pass (~60 ms of
+    // launch floor plus the small-P penalty on both pieces: 2+9+28 tokens as
+    // three passes measured 608 ms, one pass of the same 39 tokens ~400 ms),
+    // so it only earns that pass when the span it checkpoints is long enough
+    // that recomputing it later would cost more. Short spans — the
+    // "<|im_end|>\n" right after the restore point, a tool-call-sized reply —
+    // are dropped: a future turn diverging there restores from the previous
+    // checkpoint and recomputes a few tokens instead. The last cut is always
+    // kept (taken in-pass below, no extra pass). QWENOX_CUT_MIN_SPAN=0 keeps
+    // every cut.
+    static const size_t cut_min_span = [] {
+      const char* e = getenv("QWENOX_CUT_MIN_SPAN");
+      return e ? (size_t)std::max(0L, atol(e)) : (size_t)64;
+    }();
+    size_t cuts_dropped = 0;
+    if (cut_min_span && cuts.size() > 1) {
+      std::vector<size_t> kept;
+      size_t last = cont ? mcp : 0;
+      for (size_t i = 0; i < cuts.size(); i++) {
+        if (i + 1 == cuts.size() || cuts[i] - last >= cut_min_span) {
+          kept.push_back(cuts[i]);
+          last = cuts[i];
+        } else {
+          cuts_dropped++;
+        }
+      }
+      cuts.swap(kept);
+    }
     if (!cont) hist.clear();
     size_t done_upto = cont ? mcp : 0;
     // Arm the 1s prefill progress reporter for the prompt ingest only
@@ -2438,6 +2466,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       cut_tp = now;
     };
     cut_lap("pre-cuts");
+    if (cut_prof && cuts_dropped)
+      fprintf(stderr, "cutprof: %zu short cut(s) dropped (span < %zu), %zu kept\n",
+              cuts_dropped, cut_min_span, cuts.size());
     // aggr 10-05: the LAST cut is taken in-pass (no separate tiny tail pass);
     // earlier cuts keep the split path. QWENOX_CUT_INPASS=0 disables.
     size_t inpass_cc = 0;
