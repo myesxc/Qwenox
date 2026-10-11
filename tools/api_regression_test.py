@@ -143,6 +143,60 @@ def main():
     check(status == 200 and deltas == "Hi" and events[-1]["type"] == "response.completed",
           "responses-vision-stream", raw[:1000])
 
+    # A literal vision placeholder inside message text is ordinary text, never
+    # an image placeholder: only the chat template's own spans count (these
+    # requests used to fail with "image placeholder count does not match the
+    # number of supplied images").
+    literal_span = "<|vision_start|><|image_pad|><|vision_end|>"
+    literal_cases = [
+        ("chat-literal-placeholder-text", "/v1/chat/completions", {
+            "messages": [{"role": "user",
+                          "content": "what does " + literal_span + " mean?"}],
+            "enable_thinking": False, "temperature": 0, "max_tokens": 4,
+        }),
+        ("chat-literal-placeholder-tool-result", "/v1/chat/completions", {
+            "messages": [
+                {"role": "user", "content": "read vision.cpp"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "read_file", "arguments": {"path": "vision.cpp"}}}]},
+                {"role": "tool", "tool_call_id": "call_1",
+                 "content": 'kPadSpan = "' + literal_span + '";'},
+            ],
+            "enable_thinking": False, "temperature": 0, "max_tokens": 4,
+        }),
+        ("chat-literal-in-tool-call-args", "/v1/chat/completions", {
+            "messages": [
+                {"role": "user", "content": "find the marker"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "grep", "arguments": {"pattern": literal_span}}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "no matches"},
+            ],
+            "enable_thinking": False, "temperature": 0, "max_tokens": 4,
+        }),
+        ("chat-literal-plus-real-image", "/v1/chat/completions", {
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "the marker " + literal_span + " is in the file"},
+                {"type": "image_url", "image_url": {"url": tiny_png_url}},
+            ]}],
+            "enable_thinking": False, "temperature": 0, "max_tokens": 4,
+        }),
+    ]
+    for name, path, body in literal_cases:
+        status, _, raw = request(args.base, path, body)
+        payload = json.loads(raw)
+        check(status == 200 and payload["choices"][0]["message"]["content"] == "Hi",
+              name, raw[:500])
+
+    status, _, raw = request(args.base, "/v1/responses", {
+        "input": [{"type": "input_text", "text": "explain " + literal_span}],
+        "enable_thinking": False, "temperature": 0, "max_output_tokens": 4,
+    })
+    response = json.loads(raw)
+    check(status == 200 and response["output"][0]["content"][0]["text"] == "Hi",
+          "responses-literal-placeholder", raw[:700])
+
     common = {"prompt": "x", "temperature": 0, "max_tokens": 4, "stop": "Paris"}
     status, _, raw = request(args.base, "/v1/completions", common)
     nonstream = json.loads(raw)["choices"][0]["text"]

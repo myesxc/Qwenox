@@ -576,18 +576,26 @@ bool prepare_messages(const json& messages, std::vector<Frame>* frames,
 }
 
 bool encode_prompt(const std::string& prompt, const qwenox::Tokenizer& tokenizer,
-                   const std::vector<Frame>& frames, std::vector<int>* ids,
-                   std::string* error, std::vector<size_t>* starts) {
-    std::vector<size_t> pad_offsets;
-    size_t at = 0;
-    const size_t pad_in_span = std::string("<|vision_start|>").size();
-    while ((at = prompt.find(kPadSpan, at)) != std::string::npos) {
-        pad_offsets.push_back(at + pad_in_span);
-        at += std::char_traits<char>::length(kPadSpan);
-    }
+                   const std::vector<Frame>& frames, const std::vector<size_t>& pad_offsets,
+                   std::vector<int>* ids, std::string* error, std::vector<size_t>* starts) {
     if (pad_offsets.size() != frames.size()) {
         *error = "image placeholder count does not match the number of supplied images";
         return false;
+    }
+    // The offsets come from the chat template's sentinel pass; verify each one
+    // really lands on a complete placeholder span so a sentinel collision or a
+    // truncation that ate a marker cannot silently misplace the pads.
+    const size_t pad_in_span = std::string("<|vision_start|>").size();
+    const size_t span_len = std::char_traits<char>::length(kPadSpan);
+    size_t previous = 0;
+    for (size_t offset : pad_offsets) {
+        const size_t span_at = offset >= pad_in_span ? offset - pad_in_span : prompt.size();
+        if (span_at < previous || span_at + span_len > prompt.size() ||
+            prompt.compare(span_at, span_len, kPadSpan) != 0) {
+            *error = "image placeholder offset does not point at a placeholder span";
+            return false;
+        }
+        previous = span_at + span_len;
     }
 
     const std::vector<qwenox::TokenSpan> spans = tokenizer.encode_with_offsets(prompt);
