@@ -14,6 +14,10 @@
 #include <iostream>
 #include <string>
 
+#ifdef _WIN32
+#include "../gpu/os_win32.h"  // wsa_init()：Windows 下 socket 前必须 WSAStartup
+#endif
+
 #include <nlohmann/json.hpp>
 
 #include "engine_client.h"
@@ -55,6 +59,12 @@ static qwenox::GenParams params_from_json(const json& q, qwenox::Tokenizer* tok)
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    if (!wsa_init()) {
+        std::fprintf(stderr, "WSAStartup failed\n");
+        return 1;
+    }
+#endif
     bool dump_only = false;
     std::string host = "127.0.0.1:8730";
     std::string tok_dir = "models/tokenizer";
@@ -66,9 +76,16 @@ int main(int argc, char** argv) {
         else if (a == "--tokenizer" && i + 1 < argc) tok_dir = argv[++i];
         else req_line = a;
     }
-    if (req_line.empty()) {
-        std::fprintf(stderr, "usage: %s [--dump-req] [--host H:P] '<json>'\n", argv[0]);
-        return 2;
+    if (req_line.empty() || req_line == "-") {
+        // 大 ids 数组会超出 Windows 命令行长度限制（32K 字符）："-" 从 stdin 读一行 JSON。
+        std::string line_in;
+        if (!std::getline(std::cin, line_in) || line_in.empty()) {
+            std::fprintf(stderr, "usage: %s [--dump-req] [--host H:P] '<json>'\n"
+                                 "       %s [--dump-req] [--host H:P] -    (stdin 读 JSON)\n",
+                         argv[0], argv[0]);
+            return 2;
+        }
+        req_line = line_in;
     }
     json q = json::parse(req_line);
 

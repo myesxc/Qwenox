@@ -93,7 +93,8 @@ class Tokenizer:
         self.id2tok = {v: k for k, v in self.vocab.items()}
         self.ranks = {}
         for i, mg in enumerate(tj["model"]["merges"]):
-            a, b = mg.split(" ")
+            # 旧格式 "a b" 字符串；新 HF 格式 ["a", "b"] 列表对。
+            a, b = mg.split(" ") if isinstance(mg, str) else (mg[0], mg[1])
             self.ranks[(a, b)] = i
         self.special = {}
         for t in tj["added_tokens"]:
