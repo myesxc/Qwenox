@@ -249,7 +249,8 @@ bool EngineClient::read_line(std::string* line, double timeout_s) {
     }
 }
 
-bool EngineClient::send_ping_pong_c(const char* verb, std::string* line, std::string* err) {
+bool EngineClient::send_ping_pong_c(const char* verb, std::string* line, std::string* err,
+                                    double timeout_s) {
     std::lock_guard<std::mutex> lk(gen_mtx_);
     if (!connected()) {
         if (err) *err = "not connected";
@@ -264,7 +265,7 @@ bool EngineClient::send_ping_pong_c(const char* verb, std::string* line, std::st
     // request can still be in flight.
     for (;;) {
         std::string l;
-        if (!read_line(&l, next_timeout_)) {
+        if (!read_line(&l, timeout_s)) {
             if (err) *err = "timeout waiting for " + std::string(verb) + " reply";
             close();
             return false;
@@ -285,18 +286,25 @@ bool EngineClient::send_ping_pong_c(const char* verb, std::string* line, std::st
     }
 }
 
-bool EngineClient::ping(std::string* err) { return send_ping_pong_c("PING", nullptr, err); }
+bool EngineClient::ping(std::string* err) {
+    return send_ping_pong_c("PING", nullptr, err, next_timeout_);
+}
+
+bool EngineClient::probe_alive(double timeout_s) {
+    std::string err;
+    return send_ping_pong_c("PING", nullptr, &err, timeout_s);
+}
 
 bool EngineClient::info(std::string* line, std::string* err) {
-    return send_ping_pong_c("INFO", line, err);
+    return send_ping_pong_c("INFO", line, err, next_timeout_);
 }
 
 bool EngineClient::memory(std::string* line, std::string* err) {
-    return send_ping_pong_c("MEM", line, err);
+    return send_ping_pong_c("MEM", line, err, next_timeout_);
 }
 
 bool EngineClient::cstat(std::string* line, std::string* err) {
-    return send_ping_pong_c("CSTAT", line, err);
+    return send_ping_pong_c("CSTAT", line, err, next_timeout_);
 }
 
 void EngineClient::cancel(long long req) {

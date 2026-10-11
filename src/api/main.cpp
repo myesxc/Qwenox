@@ -97,6 +97,15 @@ qwenox::Tokenizer g_tok;
 bool g_tok_ready = false;  // 词表缺失降级：控制台/配置/引擎管理可用，推理 503
 std::mutex g_conn_mtx;  // serialize (re)connects
 std::atomic<long long> g_req_seq{0};
+// Counts engine processes: bumped whenever the one this API talks to is
+// replaced (admin start/stop, the supervisor seeing the new engine listen or
+// the old one exit, or a pooled socket found dead at handshake time). Each
+// EngineClient remembers the count it connected under; engine_ready() drops
+// and reopens a socket from an older count instead of reusing it, because
+// the old process's TCP close is invisible until the next write -- and the
+// next write would be the GEN. Marking stale (rather than closing from the
+// supervisor thread) never aborts a request still running on a live socket.
+std::atomic<unsigned long long> g_engine_epoch{1};
 
 // The engine runs INFO kv_slots sequences at once (QWENOX_PARALLEL, sharing
 // one KV pool; 1 = batch-1) and takes one GEN per connection.  Up to g_slots
@@ -197,10 +206,34 @@ class SlotGuard {
     qwenox::EngineClient* eng_ = nullptr;
 };
 
+void invalidate_engine_connections() {
+    g_engine_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// Connect `eng` if it is not, or if its socket predates the current engine
+// process. Holds g_conn_mtx only around the check and connect.
 bool engine_ready(qwenox::EngineClient& eng, std::string* err) {
     std::lock_guard<std::mutex> lk(g_conn_mtx);
-    if (eng.connected()) return true;
-    return eng.connect(g_cfg.engine_addr, err);
+    const unsigned long long epoch = g_engine_epoch.load(std::memory_order_acquire);
+    if (eng.connected() && eng.epoch() == epoch) return true;
+    eng.close();
+    if (!eng.connect(g_cfg.engine_addr, err)) return false;
+    eng.set_epoch(epoch);
+    return true;
+}
+
+// MEM/CSTAT on the control connection. Both are idempotent reads, so a
+// failure -- typically a socket left over from a replaced engine process,
+// which looks connected until written to -- is retried once on a fresh
+// connection rather than reported. The bump marks the generation pool stale
+// too: its sockets point at the same process.
+bool control_query(const std::function<bool(std::string*, std::string*)>& verb,
+                   std::string* line, std::string* err) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (attempt > 0) invalidate_engine_connections();
+        if (engine_ready(g_ctl, err) && verb(line, err)) return true;
+    }
+    return false;
 }
 
 // ------------------------------------------------------- incremental text --
@@ -718,9 +751,24 @@ GenOutcome run_generation(GenSpec& spec,
     }
     qwenox::EngineClient& eng = slot.engine();
     std::string err;
-    if (!engine_ready(eng, &err)) {
+    auto connect_or_502 = [&]() {
+        if (engine_ready(eng, &err)) return;
         fprintf(stderr, "REQ %s 502 engine connect failed: %s\n", log_tag.c_str(), err.c_str());
         http::fail(502, "engine not reachable: " + err, "server_error", "server_error");
+    };
+    connect_or_502();
+    // A pooled socket whose engine process went away without this API
+    // noticing (restart from a launcher or the tray, a crash) still reads as
+    // connected: the peer's close only surfaces on the next write, and the
+    // GEN is the one write that must not be lost. One PING/PONG first turns
+    // that into a reconnect. Nothing of the request has gone out at this
+    // point, so the retry cannot duplicate a generation; the rest of the
+    // pool points at the same dead process, so mark it stale as well.
+    if (!eng.probe_alive(5.0)) {
+        invalidate_engine_connections();
+        connect_or_502();
+        fprintf(stderr, "REQ %s pooled engine connection was dead; reconnected\n",
+                log_tag.c_str());
     }
 
     const long long req_id = ++g_req_seq;
@@ -1635,6 +1683,10 @@ void handle_engine_start(const http::Request& q, http::Response* r, http::Stream
     std::string err;
     if (!svcconf::validate_conf(conf, &err)) http::fail(400, err);
     if (!enginesup::start(g_conf_root, conf, &err)) http::fail(400, err);
+    // Whatever the pool is holding was opened to the engine that is gone
+    // (start is refused while one is listening). The supervisor bumps again
+    // once the new engine listens; this covers the window before that.
+    invalidate_engine_connections();
     fprintf(stderr, "qwenox-api: engine start requested by %s\n", q.remote.c_str());
     r->body = json_py::dumps(engine_status_json(), /*spaced=*/false);
 }
@@ -1653,6 +1705,7 @@ void handle_engine_stop(const http::Request& q, http::Response* r, http::Stream*
                         "own launcher");
     std::string err;
     if (!enginesup::stop(&err)) http::fail(409, err);
+    invalidate_engine_connections();
     fprintf(stderr, "qwenox-api: engine stop requested by %s\n", q.remote.c_str());
     r->body = json_py::dumps(engine_status_json(), /*spaced=*/false);
 }
@@ -1880,11 +1933,8 @@ void handle_models(const http::Request&, http::Response* r, http::Stream*) {
 
 void handle_cache(const http::Request&, http::Response* r, http::Stream*) {
     std::string line, err;
-    {
-        std::lock_guard<std::mutex> lk(g_conn_mtx);
-        if (!g_ctl.connected()) g_ctl.connect(g_cfg.engine_addr, &err);
-    }
-    if (!g_ctl.cstat(&line, &err)) {
+    if (!control_query([](std::string* l, std::string* e) { return g_ctl.cstat(l, e); },
+                       &line, &err)) {
         // The live service surfaces an engine-side probe failure this way.
         r->status = 500;
         r->body = http::error_json("internal error: TimeoutError: ", "server_error",
@@ -1898,11 +1948,8 @@ void handle_cache(const http::Request&, http::Response* r, http::Stream*) {
 
 void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
     std::string line, err;
-    {
-        std::lock_guard<std::mutex> lk(g_conn_mtx);
-        if (!g_ctl.connected()) g_ctl.connect(g_cfg.engine_addr, &err);
-    }
-    if (!g_ctl.memory(&line, &err)) {
+    if (!control_query([](std::string* l, std::string* e) { return g_ctl.memory(l, e); },
+                       &line, &err)) {
         r->status = 500;
         r->body = http::error_json("engine memory query failed: " + err,
                                    "server_error", "server_error");
@@ -3292,7 +3339,11 @@ bool probe_engine() {
     bool ok = false;
     if (!g_ctl.connect(g_cfg.engine_addr, &err, 0.3)) {
         fprintf(stderr, "qwenox-api: engine connect failed: %s\n", err.c_str());
-    } else if (g_ctl.info(&line, &err)) {
+        log_slots();
+        return false;
+    }
+    g_ctl.set_epoch(g_engine_epoch.load(std::memory_order_acquire));
+    if (g_ctl.info(&line, &err)) {
         EngineInfo ei;
         if (parse_engine_info(line, &ei)) {
             apply_engine_info(ei);
@@ -3576,6 +3627,9 @@ int main(int argc, char** argv) {
                 err.c_str());
     g_tcache.load_file();
     g_ckpt_ids = default_ckpt_tokens();
+    // 引擎由本进程启停时（托盘 / #/engine），新引擎监听或旧引擎退出都让池里
+    // 的 socket 作废；注册要先于任何 start()，不然监管线程无处通知。
+    enginesup::set_lifecycle_listener(invalidate_engine_connections);
     if (!probe_engine()) std::thread(reprobe_engine_loop).detach();
 
     http::Server srv;

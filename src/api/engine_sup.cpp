@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -28,6 +29,18 @@ namespace {
 std::mutex g_mtx;
 Status g_st;
 bool g_stopping = false;  // stop() 主动停止：监管线程把退出记为 stopped 而非 exited
+std::function<void()> g_lifecycle;  // set_lifecycle_listener()，g_mtx 保护
+
+// 锁外调用监听者：回调会去拿 API 自己的锁，持着 g_mtx 调会埋下反向锁序。
+// 只有 Windows 的监管线程会调（Linux 不启停引擎）。
+[[maybe_unused]] void notify_lifecycle() {
+    std::function<void()> fn;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        fn = g_lifecycle;
+    }
+    if (fn) fn();
+}
 
 // 能连上 host:port 说明对端已在 LISTEN（跨平台探测，Linux 也用于 external 判定）。
 // 带 500ms 超时：阻塞 connect 对黑洞地址（防火墙丢包的远程 IP）会挂 ~20s，
@@ -131,7 +144,7 @@ DWORD WINAPI tee_thread(LPVOID param) {
 }
 
 // 监管线程：starting →（端口在听）→ running →（进程退出）→ exited/stopped；
-// starting 超过 START_TIMEOUT 秒则杀掉并记 exited。
+// starting 超过 START_TIMEOUT 秒则杀掉并记 exited。两次状态翻转都通知监听者。
 DWORD WINAPI monitor_thread(LPVOID) {
     long timeout = 1800;
     if (const char* e = getenv("START_TIMEOUT")) {
@@ -143,8 +156,11 @@ DWORD WINAPI monitor_thread(LPVOID) {
     for (;;) {
         if (WaitForSingleObject(g_proc, 0) == WAIT_OBJECT_0) break;  // 提前退出
         if (port_listening(g_host, g_port)) {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            if (g_st.state == "starting") g_st.state = "running";
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                if (g_st.state == "starting") g_st.state = "running";
+            }
+            notify_lifecycle();
             break;
         }
         if (GetTickCount64() > deadline) {
@@ -168,6 +184,7 @@ DWORD WINAPI monitor_thread(LPVOID) {
         CloseHandle(g_proc);
         g_proc = nullptr;
     }
+    notify_lifecycle();
     return 0;
 }
 
@@ -181,6 +198,11 @@ bool supported() {
 #else
     return false;
 #endif
+}
+
+void set_lifecycle_listener(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_lifecycle = std::move(fn);
 }
 
 Status status(const std::string& host, int port) {

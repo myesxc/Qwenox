@@ -193,11 +193,18 @@ def main():
                         return False
 
                 wait_for(engine_ready, "fake-engine-ready")
+                # --console on Windows: the GUI build otherwise runs as the
+                # tray app, which refuses to start (modal "already running"
+                # box) while a deployed instance holds the single-instance
+                # mutex, and would redirect its log away from `log`.
+                api_cmd = [api_binary, "--tokenizer", str(root / "tokenizer"),
+                           "--engine", f"127.0.0.1:{engine_port}", "--host", "127.0.0.1",
+                           "--port", str(api_port), "--overrides", ""]
+                if os.name == "nt":
+                    api_cmd.append("--console")
                 children.append(subprocess.Popen(
-                    [api_binary, "--tokenizer", str(root / "tokenizer"),
-                     "--engine", f"127.0.0.1:{engine_port}", "--host", "127.0.0.1",
-                     "--port", str(api_port), "--overrides", ""],
-                    cwd=root, env=env, stdout=log, stderr=log, creationflags=creationflags))
+                    api_cmd, cwd=root, env=env, stdout=log, stderr=log,
+                    creationflags=creationflags))
 
                 def api_ready():
                     try:
