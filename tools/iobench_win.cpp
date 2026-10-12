@@ -1,6 +1,7 @@
 // iobench_win.cpp — random-read microbenchmark for the PLE table file (no GPU).
 //   iobench_win <file> <mode> <depth> <count> [map]
 //   mode: direct   = FILE_FLAG_NO_BUFFERING, 4 KB aligned reads, IOCP, `depth` in flight
+//         sustain  = like direct, but runs for `count` SECONDS and prints IOPS every 5 s
 //         buffered = cached overlapped reads of 160 B rows, IOCP, `depth` in flight
 //         mmap     = touch 160 B rows through a MapViewOfFile view (page faults), serial
 //   map: also keep a MapViewOfFile view of the whole file open during the run
@@ -41,6 +42,50 @@ int main(int argc, char** argv) {
   }
   const uint64_t span = (uint64_t)fsz.QuadPart - 8192;
   std::mt19937_64 rng(seed);
+  // sustain mode: `count` is seconds; unbuffered 4 KB random reads at `depth`
+  // in flight, IOPS printed every 5 s (throttling / GC shows as a drop).
+  if (!strcmp(mode, "sustain")) {
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) { fprintf(stderr, "open failed %lu\n", GetLastError()); return 1; }
+    HANDLE iocp = CreateIoCompletionPort(fh, nullptr, 0, 0);
+    std::vector<OVERLAPPED> ovs(depth);
+    std::vector<size_t> free_(depth);
+    for (size_t i = 0; i < depth; i++) free_[i] = depth - 1 - i;
+    size_t nfree = depth;
+    uint8_t* buf = (uint8_t*)VirtualAlloc(nullptr, depth * 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    OVERLAPPED_ENTRY ents[64];
+    const double secs = (double)count;
+    auto t0 = std::chrono::steady_clock::now();
+    auto tlast = t0;
+    size_t done = 0, done_win = 0;
+    printf("sustain depth=%zu for %.0f s (5 s windows)\n", depth, secs);
+    for (;;) {
+      while (nfree > 0) {
+        size_t slot = free_[--nfree];
+        OVERLAPPED* ov = &ovs[slot];
+        memset(ov, 0, sizeof *ov);
+        uint64_t off = (rng() % span) & ~4095ull;
+        ov->Offset = (DWORD)(off & 0xffffffffu); ov->OffsetHigh = (DWORD)(off >> 32);
+        BOOL r = ReadFile(fh, buf + slot * 4096, 4096, nullptr, ov);
+        if (!r && GetLastError() != ERROR_IO_PENDING) { fprintf(stderr, "ReadFile failed %lu\n", GetLastError()); return 1; }
+      }
+      ULONG n = 0;
+      if (!GetQueuedCompletionStatusEx(iocp, ents, 64, &n, INFINITE, FALSE)) { fprintf(stderr, "GQCSEx failed %lu\n", GetLastError()); return 1; }
+      for (ULONG k = 0; k < n; k++) { free_[nfree++] = (size_t)(ents[k].lpOverlapped - ovs.data()); done++; done_win++; }
+      auto now = std::chrono::steady_clock::now();
+      double w = std::chrono::duration<double>(now - tlast).count();
+      if (w >= 5.0) {
+        printf("  t=%5.0fs  %7.0f IOPS  (%.1f us/read)\n", std::chrono::duration<double>(now - t0).count(), done_win / w, w * 1e6 / done_win);
+        fflush(stdout);
+        tlast = now; done_win = 0;
+      }
+      if (std::chrono::duration<double>(now - t0).count() >= secs) break;
+    }
+    double s_all = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    printf("sustain total: %zu reads in %.1f s = %.0f IOPS\n", done, s_all, done / s_all);
+    return 0;
+  }
   std::vector<uint64_t> offs(count);
   for (auto& o : offs) o = (rng() % span);
   const bool direct = !strcmp(mode, "direct");

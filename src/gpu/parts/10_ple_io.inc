@@ -195,16 +195,13 @@ static int ple_pumps_for(int P) { return P >= 64 ? ple_pump_count() : 1; }
 // g_ple_foff + (addrs[i] - table_va) 读入 staging + i*g_ple_rb；任何失败/短读
 // 立即 fatal，不做半途回退。
 //
-// aggr 10-12: unbuffered (FILE_FLAG_NO_BUFFERING) by default. A buffered
-// overlapped ReadFile that misses the cache is serviced by the cache manager's
-// paging read, and those are serialised per file: 1, 8 and 16 pumps all read
-// cold rows at ~13K rows/s (= the NVMe at queue depth 1; an 18K prompt's
-// first chunk waited 9.6 s). With the box's 32 GB of system RAM against the
-// 47.7 GB table the rows are cold most of the time, so the cache bought
-// little anyway. Unbuffered reads are genuinely asynchronous: one port keeps
-// DEPTH reads in flight at the disk. The cost is sector alignment -- each
-// 160 B row is fetched as the 4 KB sector(s) holding it into a per-slot
-// bounce buffer and copied out. QWENOX_PLE_DIRECT=0 restores buffered reads.
+// aggr 10-12: the serialisation that capped cold reads at ~13K rows/s
+// whatever the pump count was NTFS keeping file I/O coherent with the live
+// data section of the mmapped n-gram file (Checkpoint::release_view drops
+// it); buffered overlapped reads then overlap like unbuffered ones. Optional
+// FILE_FLAG_NO_BUFFERING (QWENOX_PLE_DIRECT=1): each 160 B row is fetched as
+// the 4 KB sector(s) holding it into a per-slot bounce buffer and copied out;
+// no page-cache hits, so every row costs a NAND read (see want_direct).
 struct PleWin {
   HANDLE fh = INVALID_HANDLE_VALUE;
   HANDLE iocp = nullptr;
@@ -244,9 +241,17 @@ struct PleWin {
 
   bool ok() const { return iocp != nullptr && g_ple_off_ok; }
 
+  // Default buffered (cached) reads. Unmapping the file is what unlocked the
+  // parallelism (buffered and unbuffered both reach ~85K IOPS at depth 256
+  // once no view exists); buffered additionally serves repeated rows from the
+  // page cache (~7 us, no NAND access) -- production ple_wait of 0.12-0.18
+  // ms/token = 7-11 us/row shows the agent workload's n-grams are mostly
+  // warm. Unbuffered reads sent every row to the Crucial P3, which throttles
+  // to ~5K IOPS for ~55 s once it heats up (tools/iobench_win.cpp sustain:
+  // onset after 45-345 s depending on rate). QWENOX_PLE_DIRECT=1 opts in.
   static bool want_direct() {
     const char* e = getenv("QWENOX_PLE_DIRECT");
-    return !e || e[0] != '0';
+    return e && e[0] == '1';
   }
 
   bool setup(const char* filename) {
