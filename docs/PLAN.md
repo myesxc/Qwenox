@@ -5,27 +5,12 @@
 显存互斥）、`tools/chat_turns_replay.py`（固定多轮对话）、`tools/iobench_win.cpp`
 （纯磁盘 I/O）、`tools/perf_ab_win.sh`（qwenox-bench 离线基准）。
 
-## 1. kvsnap 检查点去重（写量减半）—— 已量化，待做
+## 1. kvsnap 写队列满时丢弃而非阻塞 —— 待做（去重后压力减半，优先级下调）
 
-**数据（生产 2026-10-11/12 两天，249 个请求）**：720 个检查点，共写 **134.6 GB**
-（检查点镜像 81.6 GB + 新页/MTP 段 53.0 GB），平均每请求 2.89 个 / 554 MB。
-**27% 的检查点与前一个只隔 ≤64 token（中位数 2 token）**；agent 式多轮对话
-（`chat_turns_replay.py`）里是 81%（中位 13 token）。写时间中位 0.15 s、p90 1.9 s、
-最大 19.4 s（D: 是 94% 满的 QLC 盘，Crucial P3）。
-
-**成因**：每轮写 ① 最后一个 SNAPS 切点（消息内容末尾，in-pass）② 回合终态
-（内容末尾 + 结束标签 + 生成的几个 token）③ 恢复点之后再次经过的旧边界。
-②与①通常只差 5–20 token；下一轮的 prompt 恰在①处分叉，②只对"同一上下文
-原样续写"有用，而这种情况由 live slot（cont）直接服务。
-
-**改法（候选）**：
-- 终态检查点若与最近一个已捕获切点距离 < N token（N=64，与 `QWENOX_CUT_MIN_SPAN`
-  同口径）则跳过 SSD 捕获（RAM rckpt 便宜可保留）。预期检查点镜像写量 −27%（生产）
-  ~ −50%（agent）。
-- 写队列（`QWENOX_KVSNAP_QUEUE_MB`，默认 1 GB）满时丢弃新快照而不是阻塞 GPU 线程
-  （现状实测把下一请求堵过 2.3 s）。丢弃需同时撤销 `g_ck` 里的 pending 登记。
-- 验证：`kvsnap: saved` 行计数/字节对比；`tools/api_regression_test.py` 的
-  kvsnap/rckpt 用例；换对话再切回来的恢复命中率不降。
+`enqueue()`（51_host_cfg.inc）在队列（`QWENOX_KVSNAP_QUEUE_MB`，默认 1 GB）满时阻塞
+GPU 线程；盘慢时实测把下一请求堵过 2.3 s。改为丢弃新快照（同时撤销 `g_ck` 的
+pending 登记、释放页引用），记一个计数到日志。去重（见已完成）把每回合写量从 2 个
+镜像降到 1 个，触发概率已明显下降，但 QLC 盘掉速时仍可能发生。
 
 ## 2. 终态 capture 的页打包（大 prefill 后省 ~150 ms）—— 已量化，低优先
 
@@ -39,7 +24,17 @@ P≤32 的段 ≈ 60 ms + 8.6 ms/token：v2 ht/q6g64 的 `gemv_multi_q4cp` 每 �
 全部权重（`gemvmr_maxp()`=24 后切 dequant+WMMA，作者已按实测调过交叉点）。要再降
 需要新的小 P（16–64 行）权重直读 kernel。
 
-## 4. QSA 长上下文（PREFILL.md §11.9/§11.10 遗留）
+## 4. SSD 掉速归因（PLE 无缓冲读持续高压后 4–12× 慢）—— 排队中
+
+现象与数据见第 5 项末尾"同一剖析暴露的更大问题"。步骤：① 跑一次 131K 冷 prefill
+的同时用 CrystalDiskInfo/管理员 PowerShell（`Get-StorageReliabilityCounter`）看 D 盘温度，
+确认是否热降频；② 若是：A/B `QWENOX_PLE_DEPTH=16/32`（限制 IOPS，看掉速是否消失、
+总 gather 时间是否反而更短）、物理散热；③ 若不是热：怀疑 QLC 盘的后台 GC（94% 满），
+试清理空间到 <80% 后复测。衡量指标：131K 冷 prefill 的每 chunk `ple_wait` 分布
+（`tools/engine_ab_win.sh` 不适用，用 /tmp/kprof_long.sh 的流程：eng_cli 直发
+`data/qsa-oracle/131072.tokens`）。
+
+## 5. QSA 长上下文（PREFILL.md §11.9/§11.10 遗留）—— 索引打分 WMMA 暂缓（2026-10-12 决定）
 
 - `k_index_scores_t64` 换 bf16 WMMA：作者估 ~2× 余地（128K 时打分 ≈ 360 ms/8K chunk），
   不再逐位一致，需先做长上下文 KLD。
@@ -60,6 +55,11 @@ P≤32 的段 ≈ 60 ms + 8.6 ms/token：v2 ht/q6g64 的 `gemv_multi_q4cp` 每 �
   失效），生产里 chunk 2 起 ple_wait=0。
 
 ## 已完成（2026-10-12）
+- kvsnap 检查点去重（commit 6fea337，已部署）：chat/responses 回合不再写终态 SSD 检查点。
+  依据：生产 38 次恢复 0 次命中终态（prompt 由历史重渲染，在 assistant 开头就分叉），
+  每回合 2 个镜像里 1 个从未被用。验证：8 轮对话检查点 16 → 8、写量 2.3 → 1.4 GB，
+  重启后 8 轮全部从切点检查点恢复且回复逐字相同，小回合下一请求等待 11–23 → 7–10 ms。
+  `QWENOX_KVSNAP_END=1` 恢复旧行为；raw completions（无提示）不受影响。
 - 中间切点跨度 <64 不拆段（`QWENOX_CUT_MIN_SPAN`，commit 77d290d）：小回合 −39%。
 - PLE 无缓冲 IOCP 并行读 + 撤 n-gram 映射（commit ddadfae）：冷读 3–8×。
 - KVSNAP_MAX_GB 20 → 30（service.conf）。
