@@ -24,15 +24,22 @@ P≤32 的段 ≈ 60 ms + 8.6 ms/token：v2 ht/q6g64 的 `gemv_multi_q4cp` 每 �
 全部权重（`gemvmr_maxp()`=24 后切 dequant+WMMA，作者已按实测调过交叉点）。要再降
 需要新的小 P（16–64 行）权重直读 kernel。
 
-## 4. SSD 掉速归因（PLE 无缓冲读持续高压后 4–12× 慢）—— 排队中
+## 4. SSD 热降频 —— 已归因（2026-10-12），软件侧已处理，物理散热待用户决定
 
-现象与数据见第 5 项末尾"同一剖析暴露的更大问题"。步骤：① 跑一次 131K 冷 prefill
-的同时用 CrystalDiskInfo/管理员 PowerShell（`Get-StorageReliabilityCounter`）看 D 盘温度，
-确认是否热降频；② 若是：A/B `QWENOX_PLE_DEPTH=16/32`（限制 IOPS，看掉速是否消失、
-总 gather 时间是否反而更短）、物理散热；③ 若不是热：怀疑 QLC 盘的后台 GC（94% 满），
-试清理空间到 <80% 后复测。衡量指标：131K 冷 prefill 的每 chunk `ple_wait` 分布
-（`tools/engine_ab_win.sh` 不适用，用 /tmp/kprof_long.sh 的流程：eng_cli 直发
-`data/qsa-oracle/131072.tokens`）。
+- **现象复现（`tools/iobench_win.cpp sustain`，纯磁盘、无 GPU）**：Crucial P3 在持续随机读下
+  周期性崩到 5–7K IOPS 约 55 s 后恢复；再加热到下次崩塌的时间与读取功率成反比
+  （QD32/80K IOPS → 60 s，QD16/59K → 240 s），冷态起 QD256 跑 180 s 不触发。这是热降频的
+  滞回特征（温度读数需管理员权限，`Get-StorageReliabilityCounter` 被拒；UAC 两次未批准）。
+  本机只有这一块盘（C/D 同盘），没有备用盘可挪 n-gram 文件。
+- **引擎里的触发因素**：引擎启动的 62 GB 权重顺序读会把盘预热（重启后首个冷 prefill 首块
+  常 12–15 s）；GPU 满载时机箱更热。限制 IOPS（`QWENOX_PLE_DEPTH`）不是对策——预取下每
+  chunk 的读量不变，盘的平均功率不变。
+- **软件侧处理（commit bae0eae，已部署）**：PLE 读默认改回缓冲（页缓存命中不碰 NAND），
+  撤映射保留（并行性来自撤映射，微基准证实缓冲/无缓冲在无映射时同为 ~85K IOPS）。生产
+  旧日志 ple_wait 0.12–0.18 ms/token 说明 agent 负载的 n-gram 行大多是热的。实测 131K
+  冷 prefill 首块 914 ms，重跑时 chunk 3 起 0.7 s/131K 行（187K 行/s = 缓存命中）。
+- **待用户**：用 CrystalDiskInfo 看 D 盘温度（跑一次长 prefill 时观察是否接近 70 °C 并出现
+  降频标志）；若确认，给 M.2 加散热片/改善风道，或换一块带 DRAM 的 NVMe 放 n-gram 文件。
 
 ## 5. QSA 长上下文（PREFILL.md §11.9/§11.10 遗留）—— 索引打分 WMMA 暂缓（2026-10-12 决定）
 
@@ -55,6 +62,7 @@ P≤32 的段 ≈ 60 ms + 8.6 ms/token：v2 ht/q6g64 的 `gemv_multi_q4cp` 每 �
   失效），生产里 chunk 2 起 ple_wait=0。
 
 ## 已完成（2026-10-12）
+- SSD 掉速归因 + PLE 读改回缓冲默认（commit bae0eae，已部署）：见第 4 项。
 - kvsnap 检查点去重（commit 6fea337，已部署）：chat/responses 回合不再写终态 SSD 检查点。
   依据：生产 38 次恢复 0 次命中终态（prompt 由历史重渲染，在 assistant 开头就分叉），
   每回合 2 个镜像里 1 个从未被用。验证：8 轮对话检查点 16 → 8、写量 2.3 → 1.4 GB，
