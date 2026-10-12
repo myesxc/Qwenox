@@ -277,6 +277,33 @@ public:
   const std::vector<Mapping>& mappings() const { return maps_; }
   const std::unordered_map<std::string, Tensor>& tensors() const { return index_; }
 
+  // Windows: drop the file view that holds p but keep its address range
+  // reserved (MEM_RESERVE, PAGE_NOACCESS), so pointer arithmetic on that
+  // file's tensors (file offset = data - base, as pload and the PLE reader
+  // compute it) stays valid while nothing can read through them any more --
+  // a stray access faults instead of returning stale bytes. Used once the
+  // n-gram table is served by ReadFile only: NTFS serialises every file I/O
+  // it must keep coherent with a live data section, which capped the table's
+  // 160 B random reads at ~5K IOPS whatever the queue depth; unmapped, the
+  // same reads reach ~90K IOPS at depth 256. The os_handle stays open. Returns
+  // false when p is in no mapping, or off Windows (mmap shares the page cache
+  // with read(2), no penalty there).
+  bool release_view(const uint8_t* p) const {
+#ifdef _WIN32
+    for (const auto& m : maps_)
+      if (p >= m.base && p < m.base + m.len) {
+        if (!UnmapViewOfFile((void*)m.base)) return false;
+        if (!VirtualAlloc((void*)m.base, m.len, MEM_RESERVE, PAGE_NOACCESS))
+          fprintf(stderr, "hgn: could not re-reserve the released view at %p (%zu bytes)\n",
+                  (const void*)m.base, m.len);
+        return true;
+      }
+#else
+    (void)p;
+#endif
+    return false;
+  }
+
 private:
   std::vector<Mapping> maps_;
   std::unordered_map<std::string, Tensor> index_;

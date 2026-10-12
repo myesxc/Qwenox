@@ -1,20 +1,35 @@
 #!/usr/bin/env bash
-# cutspan_ab_win.sh — A/B the QWENOX_CUT_MIN_SPAN change on the real weights.
-# A = new engine exe with QWENOX_CUT_MIN_SPAN=0 (legacy: every cut splits),
-# B = same exe, default (64). Stops the production engine first, verifies the
-# GPU memory is actually released before every engine start, isolates the
-# test engine's kvsnap dir and the test API's data files from production,
-# and restarts the production engine at the end.
+# engine_ab_win.sh — A/B two env configurations of the freshly built engine exe
+# on the real weights, replaying tools/chat_turns_replay.py against each.
+#
+#   bash tools/engine_ab_win.sh <label> "<A env>" "<B env>"
+#   e.g. bash tools/engine_ab_win.sh cutspan "QWENOX_CUT_MIN_SPAN=0" ""
+#        bash tools/engine_ab_win.sh plerings "QWENOX_PLE_RINGS=1" ""
+#
+# Both runs use build/qwenox-engine-win.exe from the source tree (copied to the
+# runtime dir as qwenox-engine-win-new.exe) with the production flags +
+# QWENOX_PROF=1; <A env> / <B env> are appended (empty = defaults). Stops the
+# production engine first, verifies the GPU memory is actually released before
+# every engine start (processes gone + <= 10 GiB), isolates the test engine's
+# kvsnap dir and the test API's data files from production, and restarts the
+# production engine at the end (also on failure, via the EXIT trap).
+# Outputs: logs/perf_ab/<label>_{A,B}.{engine,api}.log and .turns.
 set -u
-R=/d/llama/gfx1151-engine/qwenox
-S=/d/llama/gfx1151-engine/qwenox-code/Qwenox
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+R="${QWENOX_DIR:-$ROOT}"
+S="${QWENOX_SRC:-$ROOT}"
 OUT=$R/logs/perf_ab
 API_PORT=8731
 TE_PORT=8732
 TA_PORT=8733
 TE_EXE=qwenox-engine-win-new.exe
-KVDIR_WIN="D:/llama/gfx1151-engine/qwenox/data/kvsnap_abtest"
-APITMP=/tmp/apitest_cutspan
+KVDIR_WIN="${KVDIR_WIN:-$(cygpath -m "$R/data/kvsnap_abtest")}"
+APITMP=/tmp/apitest_ab
+
+[[ $# == 3 ]] || { sed -n '2,16p' "$0" >&2; exit 2; }
+LABEL="$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+A_ENV="$2"
+B_ENV="$3"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 gpu() {
@@ -57,26 +72,31 @@ wait_gpu_free
 for cfg in A B; do
     rm -rf "$R/data/kvsnap_abtest"; mkdir -p "$R/data/kvsnap_abtest"
     rm -f "$APITMP/data/tcache.bin"
-    export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1 \
-           QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1 \
-           QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1 \
-           QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 QWENOX_INDEX_FUSED2=1 \
-           QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 QWENOX_KV_PAGED=1 \
-           QWENOX_KVSNAP=1 QWENOX_KVSNAP_MAX_GB=5 QWENOX_KVSNAP_DIR="$KVDIR_WIN" \
-           QWENOX_RCKPT_MAX=8 QWENOX_PROF=1
-    if [[ $cfg == A ]]; then export QWENOX_CUT_MIN_SPAN=0; else unset QWENOX_CUT_MIN_SPAN; fi
-    log "== $cfg: starting test engine (CUT_MIN_SPAN=${QWENOX_CUT_MIN_SPAN:-default})"
-    EL=$OUT/cutspan_$cfg.engine.log
-    ( cd "$R" && exec "./build/$TE_EXE" models/qwen38-flash-next-v2.hgn models/qwen38-flash-next-ngram.hgn \
-        models/qwen38-flash-next-mtp.hgn --serve --host 127.0.0.1 --port $TE_PORT --maxctx 32768 ) > "$EL" 2>&1 &
+    # fresh environment per run: production flags + QWENOX_PROF + this side's overrides
+    envs=(QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
+          QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
+          QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1
+          QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 QWENOX_INDEX_FUSED2=1
+          QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 QWENOX_KV_PAGED=1
+          QWENOX_KVSNAP=1 QWENOX_KVSNAP_MAX_GB=5 "QWENOX_KVSNAP_DIR=$KVDIR_WIN"
+          QWENOX_RCKPT_MAX=8 QWENOX_PROF=1)
+    side="$A_ENV"; [[ $cfg == B ]] && side="$B_ENV"
+    # shellcheck disable=SC2206
+    [[ -n "$side" ]] && envs+=($side)
+    log "== $cfg: starting test engine (${side:-defaults})"
+    EL=$OUT/${LABEL}_$cfg.engine.log
+    # export, not an env(1) prefix: MSYS env + native exe silently exits with no output
+    ( cd "$R" && export "${envs[@]}" && exec "./build/$TE_EXE" models/qwen38-flash-next-v2.hgn \
+        models/qwen38-flash-next-ngram.hgn models/qwen38-flash-next-mtp.hgn \
+        --serve --host 127.0.0.1 --port $TE_PORT --maxctx 32768 ) > "$EL" 2>&1 &
     for _ in $(seq 1 60); do grep -q "serve: listening" "$EL" 2>/dev/null && break; sleep 5; done
     grep -q "serve: listening" "$EL" || { log "FATAL: engine did not start"; tail -5 "$EL"; exit 1; }
     log "engine up (gpu $(gpu) GiB); starting test API"
     ( cd "$APITMP" && exec "$R/build/qwenox-win.exe" --console --tokenizer "$R/models/tokenizer" \
-        --engine 127.0.0.1:$TE_PORT --host 127.0.0.1 --port $TA_PORT --context 32768 ) > "$OUT/cutspan_$cfg.api.log" 2>&1 &
+        --engine 127.0.0.1:$TE_PORT --host 127.0.0.1 --port $TA_PORT --context 32768 ) > "$OUT/${LABEL}_$cfg.api.log" 2>&1 &
     for _ in $(seq 1 30); do curl -s -m 3 "http://127.0.0.1:$TA_PORT/v1/models" >/dev/null 2>&1 && break; sleep 2; done
     log "running turns"
-    python -I "$S/tools/chat_turns_replay.py" $TA_PORT $cfg 2>&1 | tee "$OUT/cutspan_$cfg.turns"
+    python -I "$S/tools/chat_turns_replay.py" $TA_PORT $cfg 2>&1 | tee "$OUT/${LABEL}_$cfg.turns"
     log "== $cfg done; stopping test API + engine"
     kill_test_api; sleep 1
     taskkill //IM "$TE_EXE" //F >/dev/null 2>&1

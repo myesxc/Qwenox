@@ -968,6 +968,17 @@ struct GpuModel {
           g_ple_foff = (uint64_t)(ple_table->data - mp->base);
           g_ple_off_ok = true;
         }
+#ifdef _WIN32
+        // aggr 10-12: a separate n-gram file is read by the IOCP pumps only
+        // (its metadata tensors were copied above), so its view goes: with the
+        // file mapped, NTFS serialised every row read at ~5K IOPS regardless
+        // of queue depth (see Checkpoint::release_view). The base file keeps
+        // its view -- pload and the small-weight uploads still need it.
+        // QWENOX_PLE_KEEP_MAP=1 keeps the view (A/B).
+        if (g_ple_win.ok() && mp != &ckpt.mappings()[0] && !getenv("QWENOX_PLE_KEEP_MAP") &&
+            ckpt.release_view(ple_table->data))
+          fprintf(stderr, "ple: n-gram file view released (rows served by IOCP reads only)\n");
+#endif
       }
       }
     }
@@ -4971,9 +4982,10 @@ struct GpuModel {
         // IOCP/io_uring batch-pread gather: phase A is the same 16-thread row
         // address computation; the pump threads then push all 16*P rows in
         // token order through the deep rings straight into pinned staging
-        // (same multi-ring split as the inline gather; tiny P keeps one ring).
+        // (same multi-ring split as the inline gather; the per-platform
+        // ple_pumps_for decides how many pumps a chunk of P tokens gets).
         fl.addrs.resize((size_t)P * 16);
-        const int npump = P >= 64 ? std::min(nt, ple_pump_count()) : 1;
+        const int npump = std::min(nt, ple_pumps_for(P));
         fl.workers.store(npump);  // only the pump threads account for fl.done
         for (int w = 0; w < nt; w++)
           fl.pool.emplace_back([this, f, w, npump] {

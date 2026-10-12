@@ -184,6 +184,8 @@ static bool ple_uring_ready() {
   return g_ple_nrings > 0;
 }
 static int ple_pump_count() { return g_ple_nrings; }
+// Linux keeps its measured gate: tiny P stays on one ring.
+static int ple_pumps_for(int P) { return P >= 64 ? ple_pump_count() : 1; }
 #define PLE_PUMP g_ple_rings[0]
 #define PLE_PUMP_I(i) g_ple_rings[i]
 
@@ -192,10 +194,37 @@ static int ple_pump_count() { return g_ple_nrings; }
 // IOCP 批量读：与 PleUring::run 相同语义——n 个 160B 行从文件偏移
 // g_ple_foff + (addrs[i] - table_va) 读入 staging + i*g_ple_rb；任何失败/短读
 // 立即 fatal，不做半途回退。
+//
+// aggr 10-12: unbuffered (FILE_FLAG_NO_BUFFERING) by default. A buffered
+// overlapped ReadFile that misses the cache is serviced by the cache manager's
+// paging read, and those are serialised per file: 1, 8 and 16 pumps all read
+// cold rows at ~13K rows/s (= the NVMe at queue depth 1; an 18K prompt's
+// first chunk waited 9.6 s). With the box's 32 GB of system RAM against the
+// 47.7 GB table the rows are cold most of the time, so the cache bought
+// little anyway. Unbuffered reads are genuinely asynchronous: one port keeps
+// DEPTH reads in flight at the disk. The cost is sector alignment -- each
+// 160 B row is fetched as the 4 KB sector(s) holding it into a per-slot
+// bounce buffer and copied out. QWENOX_PLE_DIRECT=0 restores buffered reads.
 struct PleWin {
   HANDLE fh = INVALID_HANDLE_VALUE;
   HANDLE iocp = nullptr;
-  static constexpr size_t DEPTH = 512;
+  // Reads in flight per pump. The gfx1151 box's Crucial P3 (DRAM-less QLC)
+  // tops out near 90K 4K-random IOPS from a single queue of 256; eight pumps
+  // at 64 already exceed that, deeper only adds latency and bounce memory.
+  // QWENOX_PLE_DEPTH overrides (1..512).
+  static constexpr size_t DEPTH_MAX = 512;
+  static size_t depth_cfg() {
+    static const size_t v = [] {
+      const char* e = getenv("QWENOX_PLE_DEPTH");
+      long d = e ? atol(e) : 64;
+      return (size_t)std::max(1L, std::min((long)DEPTH_MAX, d));
+    }();
+    return v;
+  }
+  static constexpr size_t SECTOR = 4096;        // alignment unit for unbuffered reads
+  static constexpr size_t BOUNCE = 2 * SECTOR;  // a row straddles at most one boundary
+  bool direct = false;
+  uint8_t* bounce = nullptr;  // DEPTH * BOUNCE, page-aligned (direct only)
   std::string path;
 
   PleWin() = default;
@@ -206,23 +235,47 @@ struct PleWin {
   void close() {
     if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
     if (iocp) CloseHandle(iocp);
+    if (bounce) VirtualFree(bounce, 0, MEM_RELEASE);
     fh = INVALID_HANDLE_VALUE;
     iocp = nullptr;
+    bounce = nullptr;
+    direct = false;
   }
 
   bool ok() const { return iocp != nullptr && g_ple_off_ok; }
 
+  static bool want_direct() {
+    const char* e = getenv("QWENOX_PLE_DIRECT");
+    return !e || e[0] != '0';
+  }
+
   bool setup(const char* filename) {
     close();
-    fh = CreateFileA(filename, GENERIC_READ,
-                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                     nullptr, OPEN_EXISTING,
-                     FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    const DWORD base = FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS;
+    if (want_direct()) {
+      fh = CreateFileA(filename, GENERIC_READ,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       nullptr, OPEN_EXISTING, base | FILE_FLAG_NO_BUFFERING, nullptr);
+      direct = fh != INVALID_HANDLE_VALUE;
+    }
+    if (fh == INVALID_HANDLE_VALUE)
+      fh = CreateFileA(filename, GENERIC_READ,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       nullptr, OPEN_EXISTING, base, nullptr);
     if (fh == INVALID_HANDLE_VALUE) return false;
+    if (direct) {
+      bounce = (uint8_t*)VirtualAlloc(nullptr, DEPTH_MAX * BOUNCE, MEM_COMMIT | MEM_RESERVE,
+                                      PAGE_READWRITE);
+      if (!bounce) {
+        CloseHandle(fh);
+        fh = INVALID_HANDLE_VALUE;
+        direct = false;
+        return false;
+      }
+    }
     iocp = CreateIoCompletionPort(fh, nullptr, 0, 0);
     if (!iocp) {
-      CloseHandle(fh);
-      fh = INVALID_HANDLE_VALUE;
+      close();
       return false;
     }
     path = filename;
@@ -232,15 +285,17 @@ struct PleWin {
   void run(const uint64_t* addrs, uint8_t* staging, uint64_t table_va,
            size_t n) {
     // decode 每 token 只读 16 行：槽位数按需收缩，避免每 token 分配 512 槽
-    const size_t depth = std::min(DEPTH, n);
+    const size_t depth = std::min(depth_cfg(), n);
     std::vector<OVERLAPPED> ovs(depth);
-    std::vector<size_t> rows(depth);  // slot -> row（报错定位）
+    std::vector<size_t> rows(depth);     // slot -> row（报错定位 / direct 的目标行）
+    std::vector<uint32_t> skew(depth);   // direct: row offset inside its bounce buffer
     // 自由槽位队列：槽位只有在自己的 completion 到达后才能复用
     // （完成顺序任意，不能用 sub%DEPTH 环形推断）。
     std::vector<size_t> free_(depth);
     for (size_t i = 0; i < depth; i++) free_[i] = depth - 1 - i;
     size_t nfree = depth;
     size_t sub = 0, done = 0;
+    OVERLAPPED_ENTRY ents[64];
     while (done < n) {
       while (sub < n && nfree > 0) {
         size_t slot = free_[--nfree];
@@ -248,9 +303,18 @@ struct PleWin {
         OVERLAPPED* ov = &ovs[slot];
         memset(ov, 0, sizeof(*ov));
         uint64_t off = g_ple_foff + (addrs[sub] - table_va);
+        void* dst = staging + sub * g_ple_rb;
+        DWORD len = g_ple_rb;
+        if (direct) {
+          const uint64_t aoff = off & ~(uint64_t)(SECTOR - 1);
+          skew[slot] = (uint32_t)(off - aoff);
+          len = (DWORD)(skew[slot] + g_ple_rb > SECTOR ? BOUNCE : SECTOR);
+          dst = bounce + slot * BOUNCE;
+          off = aoff;
+        }
         ov->Offset = (DWORD)(off & 0xffffffffu);
         ov->OffsetHigh = (DWORD)(off >> 32);
-        BOOL r = ReadFile(fh, staging + sub * g_ple_rb, g_ple_rb, nullptr, ov);
+        BOOL r = ReadFile(fh, dst, len, nullptr, ov);
         if (!r && GetLastError() != ERROR_IO_PENDING) {
           fprintf(stderr, "ple_win: ReadFile row %zu failed: %lu\n", sub,
                   GetLastError());
@@ -258,35 +322,75 @@ struct PleWin {
         }
         sub++;
       }
-      DWORD got = 0;
-      ULONG_PTR key = 0;
-      OVERLAPPED* pov = nullptr;
-      BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
-      size_t slot = (size_t)(pov - ovs.data());
-      if (!okr || got != g_ple_rb) {
-        fprintf(stderr,
-                "ple_win: read completion failed (row=%zu, got=%lu, err=%lu)\n",
-                pov ? rows[slot] : (size_t)-1, (unsigned long)got,
-                (unsigned long)GetLastError());
+      // Reap in batches: one syscall per up to 64 completions.
+      ULONG nent = 0;
+      if (!GetQueuedCompletionStatusEx(iocp, ents, 64, &nent, INFINITE, FALSE)) {
+        fprintf(stderr, "ple_win: GetQueuedCompletionStatusEx failed: %lu\n",
+                GetLastError());
         abort();
       }
-      free_[nfree++] = slot;
-      done++;
+      for (ULONG k = 0; k < nent; k++) {
+        OVERLAPPED* pov = ents[k].lpOverlapped;
+        const DWORD got = ents[k].dwNumberOfBytesTransferred;
+        const size_t slot = (size_t)(pov - ovs.data());
+        // direct: the read may end at EOF short of the sector(s) asked for;
+        // it only has to cover the row.
+        const size_t need = direct ? skew[slot] + g_ple_rb : g_ple_rb;
+        if (!pov || slot >= depth || pov->Internal != 0 || got < need) {
+          fprintf(stderr,
+                  "ple_win: read completion failed (row=%zu, got=%lu, status=0x%lx)\n",
+                  pov && slot < depth ? rows[slot] : (size_t)-1, (unsigned long)got,
+                  pov ? (unsigned long)pov->Internal : 0ul);
+          abort();
+        }
+        if (direct)
+          memcpy(staging + rows[slot] * g_ple_rb, bounce + slot * BOUNCE + skew[slot],
+                 g_ple_rb);
+        free_[nfree++] = slot;
+        done++;
+      }
     }
   }
 };
 
-static PleWin g_ple_win;
+static PleWin g_ple_win;  // per-token reads (decode / NOSORT path): never shared with pumps
+
+// aggr 10-12: parallel pumps, as on Linux (QWENOX_PLE_RINGS, default 8). One
+// IOCP pumped by one thread did every 16*P row read with two syscalls per
+// 160 B row, and a buffered overlapped ReadFile mostly completes
+// synchronously on Windows (cache miss = this thread waits for the disk), so
+// the gather ran at ~12 us/row warm and ~60 us/row cold on a single core:
+// 1737 new tokens = 27.8K rows = 338 ms of ple_wait, 17 tokens = 17 ms. Each
+// pump owns its handle + IOCP; the decode path keeps g_ple_win to itself.
+static constexpr int kPleWinMax = 16;
+static PleWin g_ple_pumps[kPleWinMax];
+static int g_ple_npump = 0;
 
 static void ple_uring_open(const char* path) {
   // 名字沿用 Linux 版本；Windows 下建立 IOCP 句柄
   g_ple_win.setup(path);
+  int want = 8;
+  if (const char* e = getenv("QWENOX_PLE_RINGS")) want = atoi(e);
+  want = std::max(1, std::min(kPleWinMax, want));
+  g_ple_npump = 0;
+  for (int i = 0; i < want; i++) {
+    if (!g_ple_pumps[i].setup(path)) break;
+    g_ple_npump = i + 1;
+  }
+  fprintf(stderr, "ple_win: IOCP gather, %s reads, %d pump(s) x depth %zu (QWENOX_PLE_RINGS=%d)\n",
+          g_ple_win.direct ? "unbuffered" : "buffered", g_ple_npump > 0 ? g_ple_npump : 1, PleWin::depth_cfg(),
+          want);
 }
 
 static bool ple_uring_ready() { return g_ple_win.ok(); }
-static int ple_pump_count() { return 1; }
+// Pumps fall back to the per-token handle when none could be opened.
+static int ple_pump_count() { return g_ple_npump > 0 ? g_ple_npump : 1; }
+static PleWin& ple_pump_at(int i) { return g_ple_npump > 0 ? g_ple_pumps[i] : g_ple_win; }
+// Rows per pump >= 64 (P/4 tokens): a 17-token increment (272 rows) gets 4
+// pumps instead of serialising on one; P >= 32 uses all of them.
+static int ple_pumps_for(int P) { return std::max(1, std::min(ple_pump_count(), P / 4)); }
 #define PLE_PUMP g_ple_win
-#define PLE_PUMP_I(i) g_ple_win
+#define PLE_PUMP_I(i) ple_pump_at(i)
 
 struct PleWinPrefetch {
   struct Buffer {
