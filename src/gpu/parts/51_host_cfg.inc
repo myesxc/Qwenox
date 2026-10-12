@@ -2837,8 +2837,23 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // the cut captures (new pages + MTP sections + checkpoints go to the
     // background writer). Cancelled turns are valid too -- hist tracks
     // exactly the ingested tokens. The MTP layer is saved only when live.
+    //
+    // aggr 10-12: skipped for the chat/responses flow (the request carried
+    // SNAPS/SNAP hints). Those prompts are re-rendered from history, and the
+    // re-rendered assistant turn diverges from the raw generated ids right at
+    // the opener (thinking tags, retokenized reply), so the end-of-turn state
+    // is never a prefix of a later prompt: two days of production logs, 38
+    // restores, none matched the live end state, all landed on cut
+    // checkpoints -- yet every turn wrote a ~115 MB end-state image next to
+    // the cut it would have shared pages with (720 checkpoints / 135 GB,
+    // 27-81% of them within 64 tokens of the previous one). Raw completions
+    // (no hints) keep it: there the next prompt can extend this state.
+    // QWENOX_KVSNAP_END=1 restores the old always-capture behaviour.
     if (!kvs.dir.empty()) {
-      if (hist.size() >= kvs.min_tokens) kvsnap::capture(m, hist, mtp_live, pend);
+      static const bool end_always = getenv("QWENOX_KVSNAP_END") != nullptr;
+      const bool hinted = !g.snaps.empty() || g.snap || g.snap2;
+      if (hist.size() >= kvs.min_tokens && (end_always || !hinted))
+        kvsnap::capture(m, hist, mtp_live, pend);
       kvsnap::commit(m, hist, pend);
     }
   } catch (const std::exception& e) {

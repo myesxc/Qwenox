@@ -4,6 +4,7 @@
 #
 #   bash tools/engine_ab_win.sh <label> "<A env>" "<B env>"
 #   e.g. bash tools/engine_ab_win.sh cutspan "QWENOX_CUT_MIN_SPAN=0" ""
+#        KEEP_KVDIR=1 bash tools/engine_ab_win.sh restore "" ""   (B restores from A's snapshots)
 #        bash tools/engine_ab_win.sh plerings "QWENOX_PLE_RINGS=1" ""
 #
 # Both runs use build/qwenox-engine-win.exe from the source tree (copied to the
@@ -70,8 +71,12 @@ curl -s -m 10 -X POST "http://127.0.0.1:$API_PORT/admin/engine/stop" | head -c 2
 wait_gpu_free
 
 for cfg in A B; do
-    rm -rf "$R/data/kvsnap_abtest"; mkdir -p "$R/data/kvsnap_abtest"
-    rm -f "$APITMP/data/tcache.bin"
+    # KEEP_KVDIR=1: B keeps A's kvsnap dir + tcache, so B's engine (a fresh
+    # process) must restore from A's SSD checkpoints instead of prefilling.
+    if [[ $cfg == A || -z "${KEEP_KVDIR:-}" ]]; then
+        rm -rf "$R/data/kvsnap_abtest"; mkdir -p "$R/data/kvsnap_abtest"
+        rm -f "$APITMP/data/tcache.bin"
+    fi
     # fresh environment per run: production flags + QWENOX_PROF + this side's overrides
     envs=(QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
           QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
