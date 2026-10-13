@@ -295,7 +295,7 @@ struct GpuModel {
   int moe_dump_base_ = -1;      // QWENOX_MOE_TOPIDS_DUMP：记录用的当前 chunk base
   float *d_guvb, *d_hidb, *d_moeaccb, *d_eyb, *d_sgb;
   float* d_eb;              // [maxctx, 2560] PLE embeddings
-  float* ple_eb = nullptr;  // pinned staging [maxctx, 2560]
+  float* ple_eb = nullptr;  // pinned staging [maxctx, 2560] (ring slot 0)
   uint8_t* ple_eb_dev = nullptr;  // device alias of ple_eb (zero-copy fp8 staging)
   uint16_t* d_wbf16;        // dequant workspace (64 MiB)
   uint16_t* d_xbf16;        // [maxctx, 10240] bf16 activations
@@ -372,10 +372,21 @@ struct GpuModel {
   // two token ids, so the next chunk's disk gather runs on host threads while
   // this chunk's layers occupy the GPU (the gather otherwise leaves the GPU
   // idle behind embed+L0). One inflight flight, double pinned staging.
-  float* ple_eb2 = nullptr;        // second pinned staging [maxbatch_cap, 2560]
+  float* ple_eb2 = nullptr;        // second pinned staging [maxbatch_cap, 2560] (ring slot 1)
   uint8_t* ple_eb_dev2 = nullptr;  // its device alias
-  hipEvent_t ple_stg_ev[2] = {};   // recorded after each staging consume
-  bool ple_stg_ev_ok[2] = {};
+  // Gather-ahead ring: slots 0/1 are the legacy pair above (4x oversized,
+  // kept); slots 2..K-1 are sized to the real fp8 row bytes. A worker thread
+  // gathers chunk after chunk up to K ahead of the GPU, so the Crucial P3's
+  // periodic slow phase (~55 s at ~9K IOPS every ~4 min under sustained
+  // reads; PLAN.md §4) is absorbed by the buffer instead of stalling each
+  // chunk's PLE join. Host (pinned) memory only -- the device side still
+  // consumes one chunk at a time, so VRAM does not grow.
+  std::vector<uint8_t*> ple_ring;
+  std::vector<uint8_t*> ple_ring_dev;
+  std::vector<hipEvent_t> ple_ring_ev;  // recorded after each slot's consume
+  std::vector<bool> ple_ring_ev_ok;
+  int ple_ring_k = 2;   // slots (>= 2; growable via QWENOX_PLE_AHEAD_MB)
+  bool ple_ahead_on = true;  // chain on (QWENOX_PLE_AHEAD_MB=0 disables)
   int ple_par = 0;                 // staging buffer the next gather writes
   struct PleFlight {
     std::vector<std::thread> pool;
@@ -389,6 +400,20 @@ struct GpuModel {
     bool valid = false;
     std::chrono::steady_clock::time_point start, done;
   } ple_fl;
+  // Gather-ahead chain state (see ple_ahead_start): one worker thread walks
+  // the segment's chunk list, writing slot i%K after the consumer's consume
+  // event for that slot (bounded ring); the consumer waits for ready > i.
+  struct PleAhead {
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<int> toks;               // the whole segment's tokens
+    std::vector<int> base, n, pre0, pre1;
+    std::vector<double> g_ms;            // per-chunk gather duration (prof)
+    std::chrono::steady_clock::time_point t0;  // chain start (prof lead)
+    int ready = 0, consumed = 0;
+    bool stop = false, active = false;
+  } ple_ahead;
 
   // ---- MTP speculative draft head (Phase A) ----
   // Single QSA+MoE layer on top of the trunk's 48-layer stream; predicts
@@ -624,8 +649,42 @@ struct GpuModel {
       CK(hipHostGetDevicePointer((void**)&ple_eb_dev, ple_eb, 0));
       CK(hipHostMalloc((void**)&ple_eb2, BP * 2560 * 4, hipHostMallocDefault));
       CK(hipHostGetDevicePointer((void**)&ple_eb_dev2, ple_eb2, 0));
-      CK(hipEventCreateWithFlags(&ple_stg_ev[0], hipEventDisableTiming));
-      CK(hipEventCreateWithFlags(&ple_stg_ev[1], hipEventDisableTiming));
+      {
+        // Gather-ahead ring: slots 0/1 alias the legacy pair; 2..K-1 are
+        // sized to the real fp8 row bytes (BP x 2560). Budget in MB via
+        // QWENOX_PLE_AHEAD_MB (0 = legacy single/double flight only).
+        const char* e = getenv("QWENOX_PLE_AHEAD_MB");
+        const long budget_mb = e ? atol(e) : 256;
+        const size_t chunk_b = (size_t)BP * 2560;
+        ple_ahead_on = budget_mb > 0;
+        int k = 2;
+        if (budget_mb > 0) {
+          k = (int)std::max(2L, std::min(16L, (long)(((size_t)budget_mb << 20) / chunk_b)));
+        }
+        ple_ring_k = k;
+        ple_ring.assign((size_t)k, nullptr);
+        ple_ring_dev.assign((size_t)k, nullptr);
+        ple_ring[0] = (uint8_t*)ple_eb;
+        ple_ring_dev[0] = ple_eb_dev;
+        ple_ring[1] = (uint8_t*)ple_eb2;
+        ple_ring_dev[1] = ple_eb_dev2;
+        size_t added = 0;
+        for (int i = 2; i < k; i++) {
+          uint8_t* p = nullptr;
+          CK(hipHostMalloc((void**)&p, chunk_b, hipHostMallocDefault));
+          CK(hipHostGetDevicePointer((void**)&ple_ring_dev[i], p, 0));
+          ple_ring[i] = p;
+          added += chunk_b;
+        }
+        ple_ring_ev.assign((size_t)k, nullptr);
+        ple_ring_ev_ok.assign((size_t)k, false);
+        for (int i = 0; i < k; i++)
+          CK(hipEventCreateWithFlags(&ple_ring_ev[i], hipEventDisableTiming));
+        fprintf(stderr,
+                "ple: gather-ahead ring %d slots (%.0f MB host pinned added; "
+                "QWENOX_PLE_AHEAD_MB=%ld)\n",
+                k, added / 1048576.0, budget_mb);
+      }
       DALLOC(&d_wbf16, (size_t)64 << 20);  // fits q_proj 12288x2560 bf16
       DALLOC(&d_xbf16, BP * 10240 * 2);
       DALLOC(&d_xbf16b, BP * 6144 * 2);  // largest non-cacheable K = 6144
@@ -4965,10 +5024,18 @@ struct GpuModel {
     fl.fp8 = fp8;
     fl.buf = buf;
     fl.start = std::chrono::steady_clock::now();
-    if (ple_stg_ev_ok[buf]) {
+    ple_gather_run(fl);
+    ple_test_slow(base / std::max(1, maxbatch));  // test knob (see above)
+    fl.valid = true;
+  }
+  // The gather workers for one flight (the chain's local flights and the
+  // legacy member flight share this body).
+  void ple_gather_run(PleFlight& fl) {
+    const int buf = fl.buf;
+    if (ple_ring_ev_ok[buf]) {
       // Staging was last consumed by an earlier chunk's dequant; in steady
       // state that kernel finished two chunks ago, so this never blocks.
-      CK(hipEventSynchronize(ple_stg_ev[buf]));
+      CK(hipEventSynchronize(ple_ring_ev[buf]));
     }
     const int P = fl.P;
     PleFlight* f = &fl;
@@ -5068,11 +5135,129 @@ struct GpuModel {
             f->done = std::chrono::steady_clock::now();
         });
     }
-    fl.valid = true;
   }
   void ple_join() {
     for (auto& th : ple_fl.pool) th.join();
     ple_fl.pool.clear();
+  }
+
+  // ---- gather-ahead chain (see PleAhead) ----------------------------------
+  // Chunk list with the same sizing rule as prefill_batch, so the consumer
+  // can locate its chunk by (base, P). No-op when PLE is off, the chain is
+  // disabled (QWENOX_PLE_AHEAD_MB=0 / QWENOX_PLE_NOPREFETCH), or the segment
+  // is a single chunk (the legacy inline spawn already overlaps embed+L0).
+  void ple_ahead_start(const std::vector<int>& toks, int base0, int64_t pre0,
+                       int64_t pre1) {
+    ple_ahead_finish();
+    if (ple_fl.valid) {  // drain a pending legacy flight before reusing slots
+      ple_join();
+      ple_fl.valid = false;
+    }
+    PleAhead& pa = ple_ahead;
+    pa.active = false;
+    if (!ple_on || !ple_ahead_on || getenv("QWENOX_PLE_NOPREFETCH")) return;
+    pa.toks = toks;
+    pa.base.clear();
+    pa.n.clear();
+    pa.pre0.clear();
+    pa.pre1.clear();
+    for (int off = 0; off < (int)toks.size();) {
+      const int n = ple_prefetch::chunk_size((int)toks.size() - off, maxbatch,
+                                             maxbatch_cap);
+      pa.base.push_back(base0 + off);
+      pa.n.push_back(n);
+      pa.pre0.push_back(off == 0 ? pre0 : (int64_t)toks[(size_t)off - 1]);
+      pa.pre1.push_back(off == 0 ? pre1
+                                 : (off >= 2 ? (int64_t)toks[(size_t)off - 2] : pre0));
+      off += n;
+    }
+    if (pa.n.size() < 2) return;  // single chunk: legacy path
+    pa.g_ms.assign(pa.n.size(), 0.0);
+    pa.t0 = std::chrono::steady_clock::now();
+    pa.ready = pa.consumed = 0;
+    pa.stop = false;
+    pa.active = true;
+    pa.th = std::thread([this] { ple_ahead_worker(); });
+  }
+  void ple_ahead_worker() {
+    PleAhead& pa = ple_ahead;
+    PleFlight fl;  // local: its workers are joined before the next chunk
+    for (size_t i = 0; i < pa.n.size(); i++) {
+      const int slot = (int)(i % (size_t)ple_ring_k);
+      {
+        std::unique_lock<std::mutex> lk(pa.m);
+        pa.cv.wait(lk, [&] { return pa.stop || pa.consumed + ple_ring_k > (int)i; });
+        if (pa.stop) return;
+      }
+      const int off = pa.base[i] - pa.base[0];
+      fl.toks.assign(pa.toks.begin() + off, pa.toks.begin() + off + pa.n[i]);
+      fl.base = pa.base[i];
+      fl.P = pa.n[i];
+      fl.pre0 = pa.pre0[i];
+      fl.pre1 = pa.pre1[i];
+      fl.fp8 = ple_ring[slot];
+      fl.buf = slot;
+      fl.start = std::chrono::steady_clock::now();
+      ple_gather_run(fl);
+      for (auto& th : fl.pool) th.join();
+      fl.pool.clear();
+      pa.g_ms[i] = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - fl.start)
+                       .count();
+      ple_test_slow((int)i);
+      if (prof) {
+        const double lead =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          pa.t0)
+                .count() -
+            pa.g_ms[i] / 1000.0;
+        fprintf(stderr, "ple-ahead: chunk %zu gathered in %.2fs (lead %.1fs)%s\n",
+                i, pa.g_ms[i] / 1000.0, lead,
+                i + 1 == pa.n.size() ? " -- all chunks ready" : "");
+      }
+      {
+        std::lock_guard<std::mutex> lk(pa.m);
+        pa.ready = (int)i + 1;
+      }
+      pa.cv.notify_all();
+    }
+  }
+  // Stop and join the chain (idempotent; safe from a scope guard).
+  void ple_ahead_finish() {
+    PleAhead& pa = ple_ahead;
+    if (!pa.active) return;
+    {
+      std::lock_guard<std::mutex> lk(pa.m);
+      pa.stop = true;
+    }
+    pa.cv.notify_all();
+    if (pa.th.joinable()) pa.th.join();
+    pa.active = false;
+  }
+  // Test-only (QWENOX_PLE_TEST_SLOW="<from_chunk>:<ms>"): make every chunk
+  // with index >= from_chunk take ms longer to gather, simulating the SSD's
+  // periodic slow phase deterministically so the gather-ahead ring can be
+  // A/B'd without waiting for the drive to misbehave. Off by default.
+  void ple_test_slow(int idx) {
+    static const long from = [] {
+      const char* e = getenv("QWENOX_PLE_TEST_SLOW");
+      return e ? atol(e) : -1L;
+    }();
+    static const long ms = [] {
+      const char* e = getenv("QWENOX_PLE_TEST_SLOW");
+      const char* c = e ? strchr(e, ':') : nullptr;
+      return c ? atol(c + 1) : 0L;
+    }();
+    if (from >= 0 && idx >= from && ms > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+  }
+  // Consumer: chunk index in the chain by (base, P), -1 when not found.
+  int ple_ahead_index(int base, int P) {
+    PleAhead& pa = ple_ahead;
+    if (!pa.active) return -1;
+    for (size_t i = 0; i < pa.base.size(); i++)
+      if (pa.base[i] == base && pa.n[i] == P) return (int)i;
+    return -1;
   }
 
   // QWENOX_VGDUMP (debug): sync + D2H an arbitrary device buffer, FNV-1a hash.
@@ -5130,7 +5315,7 @@ struct GpuModel {
   // add. Under verify graph capture (P3-B) the staging-free event is skipped:
   // the round's closing blocking D2H fences the staging reuse instead.
   void enq_ple_device_b(int P, int base, int buf) {
-    uint8_t* stg_dev = buf ? ple_eb_dev2 : ple_eb_dev;
+    uint8_t* stg_dev = ple_ring_dev[buf];
     // dequant staging -> f32 d_eb on GPU (zero-copy read of pinned staging)
     if (ple_iq4) {
       size_t nb = (size_t)P * 2560 / 32;
@@ -5143,10 +5328,10 @@ struct GpuModel {
     }
     // staging is free once the dequant ran; gates the next gather into buf.
     if (!vg_capturing_) {
-      CK(hipEventRecord(ple_stg_ev[buf], g_str));
-      ple_stg_ev_ok[buf] = true;
+      CK(hipEventRecord(ple_ring_ev[buf], g_str));
+      ple_ring_ev_ok[buf] = true;
     }
-    ple_par = buf ^ 1;  // this buffer consumed; the next gather writes the other
+    if (buf < 2) ple_par = buf ^ 1;  // legacy pair: the next gather writes the other
     float* hc_storage = d_Rb;
     if (gr_bf16) {
       uint64_t n = (uint64_t)P * 10240;
@@ -5169,6 +5354,19 @@ struct GpuModel {
   int prefill_batch(const std::vector<int>& tokens, int base = 0, bool final = true,
                     bool quiet = false) {
     int N = (int)tokens.size();
+    // Gather-ahead: for multi-chunk segments a worker thread fetches the PLE
+    // rows up to K chunks ahead of the GPU, so a disk slow phase is absorbed
+    // by the ring instead of stalling every chunk's PLE join. No-op for
+    // single-chunk segments / PLE off (legacy inline spawn keeps those).
+    {
+      const int64_t pre0 = chist.empty() ? pad_id : chist.back();
+      const int64_t pre1 = chist.size() < 2 ? pad_id : chist[chist.size() - 2];
+      ple_ahead_start(tokens, base, pre0, pre1);
+    }
+    struct AheadGuard {
+      GpuModel* m;
+      ~AheadGuard() { m->ple_ahead_finish(); }
+    } ahead_guard{this};
     int id = -1;
     for (int off = 0; off < N;) {
       int rem = N - off;
@@ -5258,7 +5456,8 @@ struct GpuModel {
     // chunk, quiet re-ingest, or a flight mismatch). Either way the gather
     // fills staging buffer ple_par and its GPU consumer stays ordered after L0.
     if (ple_on) {
-      if (!(ple_fl.valid && ple_fl.base == base && ple_fl.P == P)) {
+      const int ahead = ple_ahead_index(base, P);
+      if (ahead < 0 && !(ple_fl.valid && ple_fl.base == base && ple_fl.P == P)) {
         if (ple_fl.valid) {  // stale flight for another chunk: finish and drop
           ple_join();
           ple_fl.valid = false;
@@ -5298,18 +5497,42 @@ struct GpuModel {
     if (prog_total > 0) prog_probe(0, P);
     phase("embed+L0", TP);
     if (ple_on) {
+      const int ahead = ple_ahead_index(base, P);
       auto wait_start = std::chrono::steady_clock::now();
-      ple_join();
+      if (ahead >= 0) {
+        // gather-ahead chain: wait until the worker has this chunk's rows.
+        PleAhead& pa = ple_ahead;
+        std::unique_lock<std::mutex> lk(pa.m);
+        pa.cv.wait(lk, [&] { return pa.ready > ahead; });
+      } else {
+        ple_join();
+      }
       auto wait_done = std::chrono::steady_clock::now();
       if (prof) {
-        p_pleh += std::chrono::duration<double, std::milli>(ple_fl.done - ple_fl.start)
-                      .count();
+        p_pleh += ahead >= 0
+                      ? ple_ahead.g_ms[(size_t)ahead]
+                      : std::chrono::duration<double, std::milli>(ple_fl.done -
+                                                                  ple_fl.start)
+                            .count();
         p_ple_wait +=
             std::chrono::duration<double, std::milli>(wait_done - wait_start).count();
       }
-      const int buf = ple_fl.buf;
-      ple_fl.valid = false;
+      int buf;
+      if (ahead >= 0) {
+        buf = ahead % ple_ring_k;
+      } else {
+        buf = ple_fl.buf;
+        ple_fl.valid = false;
+      }
       enq_ple_device_b(P, base, buf);
+      if (ahead >= 0) {  // slot free for the producer's next lap
+        PleAhead& pa = ple_ahead;
+        {
+          std::lock_guard<std::mutex> lk(pa.m);
+          pa.consumed = ahead + 1;
+        }
+        pa.cv.notify_all();
+      }
       vg_dump_row("vgp", P, base);
     }
     phase("ple", TP);
@@ -5338,7 +5561,8 @@ struct GpuModel {
     // pure functions of token ids, all known now; staging is double-buffered).
     // QWENOX_PLE_NOPREFETCH disables for A/B.
     static const bool ple_noprefetch = getenv("QWENOX_PLE_NOPREFETCH") != nullptr;
-    if (ple_on && nxt && !nxt->empty() && !ple_fl.valid && !ple_noprefetch) {
+    if (ple_on && nxt && !nxt->empty() && !ple_fl.valid && !ple_noprefetch &&
+        !ple_ahead.active) {
       const int64_t pre0 = chist.empty() ? pad_id : chist.back();
       const int64_t pre1 = chist.size() < 2 ? pad_id : chist[chist.size() - 2];
       ple_spawn(std::vector<int>(*nxt), base + P, pre0, pre1,
