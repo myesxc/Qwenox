@@ -45,10 +45,13 @@ chunk 8–11 变慢就是它）。小增量撞上慢速期：1747 token 从 0.3 
 
 **可选对策（按代价）**：
 1. ~~给盘腾出空间~~ **已实测无效（2026-10-13）**：D 盘 94% → 87%（空闲 437 GB，TRIM 开启），等 TRIM/GC 消化约 40 分钟后重测：12 分钟持续读里崩塌在 t=170/425/675 s 各一次（间隔 ~255 s、时长 55 s、~9.5K IOPS），与腾空间前（间隔 200–300 s、55 s）完全一致；最初两轮 6 分钟看似无崩塌只是相位巧合。备用空间不是诱因。
-2. 引擎 PLE 全 prompt 提前聚集（gather-ahead）：请求一到就按内存预算（如 512 MB pinned）
-   连续聚集后续 chunk 的行，不等 GPU 消费；磁盘 1.4 s/chunk 远快于 GPU 6 s/chunk，能把
-   55 s 慢速期整段吸收掉（首块除外）。改 `PleFlight` 为多缓冲队列，~200 行。
-   收益：冷长 prefill 不再被慢速期拖慢（生产每天约 7 次 95K–234K 冷重算，各省 20–30%）。
+2. ~~引擎 PLE 全 prompt 提前聚集（gather-ahead）~~ **已完成并部署（commit 19f800c）**：
+   `prefill_batch` 对多 chunk 段启动后台链，把该段 PLE 行连续聚集进 K 槽环形 pinned 暂存
+   （`QWENOX_PLE_AHEAD_MB` 默认 256 MB → 8K chunk 12 槽；=0 关闭）。实测领先量：chunk 4
+   时 11.8 s、chunk 8 时 48 s、结尾 109.8 s（`QWENOX_PROF=1` 打 `ple-ahead:` 行）——
+   55 s 慢速期从 chunk 10 起被完全吸收，中段（chunk 5–9）部分吸收，开头几个 chunk 无
+   改善（还没攒出领先）。无慢速期时与旧路径等价（131K：101.3 vs 104.5 s）。显存零增加
+   （device 87.38 GiB 不变，pinned host +0.2 GiB）。测试旋钮 `QWENOX_PLE_TEST_SLOW="<chunk>:<ms>"`。
 3. 引擎内 160 B 行级 LRU 缓存（比 4 KB 页缓存省 25× 内存）：先用 `QWENOX_PROF` 统计一天
    内唯一行/总行的比例再决定；命中率高则磁盘读与慢速期一起减少。
 4. 换一块 TLC + DRAM 的 NVMe 专放 47.7 GB n-gram 文件（最稳）。
