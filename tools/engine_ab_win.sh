@@ -84,7 +84,8 @@ for cfg in A B; do
           QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1 QWENOX_INDEX_FUSED2=1
           QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1 QWENOX_KV_PAGED=1
           QWENOX_KVSNAP=1 QWENOX_KVSNAP_MAX_GB=5 "QWENOX_KVSNAP_DIR=$KVDIR_WIN"
-          QWENOX_RCKPT_MAX=8 QWENOX_PROF=1)
+          QWENOX_RCKPT_MAX=8)
+    [[ -z "${NOPROF:-}" ]] && envs+=(QWENOX_PROF=1)
     side="$A_ENV"; [[ $cfg == B ]] && side="$B_ENV"
     # shellcheck disable=SC2206
     [[ -n "$side" ]] && envs+=($side)
