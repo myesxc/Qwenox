@@ -2,6 +2,7 @@
 //   iobench_win <file> <mode> <depth> <count> [map]
 //   mode: direct   = FILE_FLAG_NO_BUFFERING, 4 KB aligned reads, IOCP, `depth` in flight
 //         sustain  = like direct, but runs for `count` SECONDS and prints IOPS every 5 s
+//         sustainb = sustain with cached reads (immune to section serialisation)
 //         buffered = cached overlapped reads of 160 B rows, IOCP, `depth` in flight
 //         mmap     = touch 160 B rows through a MapViewOfFile view (page faults), serial
 //   map: also keep a MapViewOfFile view of the whole file open during the run
@@ -44,9 +45,13 @@ int main(int argc, char** argv) {
   std::mt19937_64 rng(seed);
   // sustain mode: `count` is seconds; unbuffered 4 KB random reads at `depth`
   // in flight, IOPS printed every 5 s (throttling / GC shows as a drop).
-  if (!strcmp(mode, "sustain")) {
+  // sustainb: same loop with cached (buffered) reads -- unbuffered I/O is
+  // serialised by NTFS whenever the file has a cache section or a user mapping
+  // (see PLAN.md), so compare both before blaming the drive.
+  const bool sustain_buf = !strcmp(mode, "sustainb");
+  if (!strcmp(mode, "sustain") || sustain_buf) {
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                            FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, nullptr);
+                            FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS | (sustain_buf ? 0 : FILE_FLAG_NO_BUFFERING), nullptr);
     if (fh == INVALID_HANDLE_VALUE) { fprintf(stderr, "open failed %lu\n", GetLastError()); return 1; }
     HANDLE iocp = CreateIoCompletionPort(fh, nullptr, 0, 0);
     std::vector<OVERLAPPED> ovs(depth);
@@ -59,7 +64,7 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     auto tlast = t0;
     size_t done = 0, done_win = 0;
-    printf("sustain depth=%zu for %.0f s (5 s windows)\n", depth, secs);
+    printf("sustain%s depth=%zu for %.0f s (5 s windows)\n", sustain_buf ? " (buffered)" : " (unbuffered)", depth, secs);
     for (;;) {
       while (nfree > 0) {
         size_t slot = free_[--nfree];
