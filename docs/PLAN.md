@@ -190,6 +190,88 @@ MTP acceptance 从 ~0.78 降到 ~0.40 是上游自适应 γ（γ 3–5、commit/
 （见第 4 项）。虽与本次截断无关，但期间任何在飞请求都会被拖慢/堵住，值得留意；
 若频繁出现，可考虑把 KVSNAP_MAX_GB 调小或换盘放 `data/kvsnap`。
 
+## 10. 输出在标记串处中断（`<|image_pad|>` / `<analysis>`）—— 审计与计划（2026-10-14 深夜）
+
+**现象**：让模型解释 vision 占位符那个 bug 时，答案每次都在写到标记串后就结束——5 个会话
+6 次收尾全部如此（`<|vision_start|><|image_pad|>`、`<|vision_end|><|image_pad|>`、
+`<|im_start|><|image_pad|>`；"继续"后停在 `<analysis>`）。合并前的版本同样出现（用户实测）。
+
+**已核实：不是被掐断，是模型自己发了 EOS**
+- 今天所有请求的引擎结束原因只有 `| done`（EOS）66 次与 `| length`（预算）38 次，**零 `| cancel`**；
+  API 侧零次停止串命中（`REQ n end ... (stop)` 后缀一次没出现）。
+- 正文没丢字：从 `data/tcache.bin`（GDTC1 格式，u64 n + n×i32）解出那几次请求的生成 id 序列，
+  末尾正是可见文本的最后一个字符，其后直接是 EOS（EOS 在发送前被拦下，故不在序列里）。
+  例：REQ 37（41753 ids）末尾 = ``53948`_prompt' … 4307'Ġentire' 21685'Ġrendered' 1414'Ġtext'
+  364'Ġfor' 328'Ġ"' `` + `248053:<|vision_start|>[SP]` + `'<','|','image','_pad','|','>'`。
+- 结论：模型在写出这种"标记串"后立即输出 `<|im_end|>`。
+
+**审计到的真问题：同一串标记文本在不同路径下编成不同 id（"杂交"形态）**
+- 只有 image/video pad（248056/248057）在**文本**路径被排除（`encode_spliced` 的 `kTextNoPads`、
+  `encode_prompt` 里"非模板放置的 pad"分支，均为 28047d4）；`<|vision_start|>`(248053)、
+  `<|vision_end|>`(248054)、`<|vision_pad|>`(248055)、`<|audio_*|>` 等**只要出现在文本里就编成真
+  special token**。
+- 于是提示里是杂交形态：`<|vision_start|>` 是 special token，紧跟的 `<|image_pad|>` 是普通文本；
+  **模型照抄提示，自己输出时也正是这个形态**（上面 tcache 末尾逐 id 可证）。
+- 训练分布里没有这个形态：模板中 pad 永远是 special token，且 `<|vision_start|>…<|vision_end|>`
+  图像块永远在 user 消息里、紧随其后就是 `<|im_end|>`。模型一"进入"该区域就把回合收尾——
+  这是目前最可信的解释（另一候选见计划 B，需一次实验区分）。
+- 次生影响：① 前缀/检查点命中率——引擎活跃序列含模型写出的 special token，而客户端重渲染的提示
+  是普通文本，两边在标记处必然分叉，日志里成片的 `no live prefix; ... first mismatch at N` 就是它；
+  ② 缓存复用会把这个不一致固化：`TokenCache::cut` 只拒绝"紧跟在 `<|vision_start|>`/pad 之后"切，
+  复用前缀**中间**的 `vision_start`/`vision_end`/`audio_*` 仍以 special id 传下去，与本次新编的
+  尾巴（普通文本）自相矛盾；③ `compute_snap_cuts` 用 `ng.text.rfind("<|im_end|>")` 取最后一条消息的
+  收尾位置，正文里出现该字面串时会取到内容里的那个（只影响快照切点，不影响正确性）。
+- 引擎侧的边界：提示里出现 stray pad 会被硬拒（`51_host_cfg.inc`：`vision: req N rejected: image
+  placeholder id 248056 at prompt pos P without MROPE/VIMG`，其它标记不拒）；**生成**里的 added token
+  只有两个 ckpt id（`<tool_call>`、``）走"暂停—串行 ingest—MTP 配对"的特殊路径，其余 added token
+  直接走普通路径（计划 B 要判定这是否有问题）。
+
+**计划**（A 立即可做；B 用一次实验决定是否动引擎；C/D 纵深防御）
+
+**A. 标记文本的编码唯一化**（小改动，建议先做）
+1. 把"非模板放置的 vision/audio 占位标记"在**文本**路径一律按普通文本编码：排除集从
+   `{248056,248057}` 扩为 `{248053,248054,248055,248056,248057,248070,248071,248076}`
+   （vision_start/end、vision_pad、image/video_pad、audio_start/end、audio_pad）。
+   **作用域必须精确**：vision 路径里由模板 span（`kPadSpan` 的 `pad_offsets`）放置的那一对
+   `<|vision_start|>/<|vision_end|>` 必须保持 special（真图片请求靠它们），只排除"落在模板 span
+   之外"的同名标记；纯文本路径没有模板 span，可整集排除。
+2. `TokenCache::cut` 的"不跨越"集合从 `{vstart, pads}` 扩为**整个排除集**：任何以 special 形式
+   存在的这些 id 都不再被复用（否则第 1 条会被缓存复用绕回去）。
+3. 单测：`tok_cli`/`vision_test` 增加"同一段含标记的文本在纯文本路径 / vision 路径 / 缓存复用
+   路径下得到同一 id 序列"的断言；现有 8 例保持通过。
+4. 预期：提示里不再有杂交标记，模型照抄提示写出的也是纯文本 → 触发条件消失；`no live prefix`
+   出现率随之下降（可作指标）。风险低：真图片请求路径不变。
+
+**A′. 输出侧禁止生成这些占位标记**（3 行的补充，建议与 A 同批）
+请求未显式给 bias 时，默认给占位标记 id 加一个大负偏置（引擎的 `BIAS` 已支持、上限校验
+`< 248320`）：模型再想写标记就只能写成普通文本，杂交形态在**源头**消失（历史文本自然是干净的）。
+注意别把工具/思考语法（`<tool_call>`、``、`<tool_response>`）一起禁掉。
+
+**B. 判定"EOS 是模型自己的选择还是引擎在 added token 处的状态问题"**（一次实验）
+- 用 `data/tcache.bin` 里记录的**精确 prompt id** 重放（新工具 `tools/engine_replay_ids.py`：
+  直接对引擎端口说 `GEN <req> <max_tokens> 2 248046 248044 <n> <ids...>`，收 `T` 行到 `D` 行，
+  贪心、无 SAMPLE）；`--prompt-only` 与 `--with-generated`（把模型已生成的部分也喂回去接着写）
+  两种都跑。
+- 对照：`QWENOX_DRAFTER=chain`（默认）vs `QWENOX_DRAFTER=serial`（`0`，纯串行）。
+  - 若 serial 不再在标记处结束 → **投机路径在 added token 上的状态不对**：把 `ckpt_pause` 那套
+    （串行 ingest + `mtp_ingest_b` 配对）从 ckpt 两个 id 推广到**输出里出现的所有 added token**
+    （`ckpt_toks` 扩为"模板切点 ∪ 输出 added token"，或对 added token 直接短路成串行一步）。
+    这条与"合并前也有"吻合（投机机制早于合并）。
+  - 若两组都在同一处结束 → 确认是模型分布问题，按 A/A′ 走。
+- 同一工具还能验收 A：用"排除集"重新编码同一段文本再重放，看是否继续输出。
+
+**C. 服务端纵深防御：不该进正文的 special token 就别进正文**
+生成流里遇到"非预期"的 added token（不在工具/思考语法白名单里）时，按 llama.cpp 的
+`skip_special_tokens` 语义从正文剔除或按边界收尾，并如实报 `finish_reason`（与 §9 的
+`finish_reason_for` 同向）。需要一个白名单，避免把 `</tool_call>`/`` 剔掉。
+
+**D. 引擎侧提示卫生观测（可选）**：把现在只查 pad 的 stray-placeholder 检查扩成"统计所有
+structural added token（vision/audio 标记）在提示里出现的次数并打一行日志"（不拒绝、只观测），
+下次一眼就能看出提示里有没有杂交标记。
+
+**验证清单**：`build_win.sh test`（ktest 354/354）+ `vision_test` + `toolparse_test` + A3 新断言；
+生产观察：`no live prefix` 出现率、结束原因分布（`| done`/`| length`）、"答案在标记处中断"的复现次数。
+
 ## 已完成（2026-10-12）
 - SSD 慢速期归因（10-13 更正为盘固件后台行为，非热）+ PLE 读改回缓冲默认（commit bae0eae，已部署）：见第 4 项。
 - kvsnap 检查点去重（commit 6fea337，已部署）：chat/responses 回合不再写终态 SSD 检查点。
