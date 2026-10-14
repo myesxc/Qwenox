@@ -1,14 +1,28 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-style="cassette">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title data-i18n="app.title">Qwen-Flash-Server 控制台</title>
-<link rel="stylesheet" href="/style.css">
+<!-- 界面风格：每份皮肤的规则都挂在 <html data-style="..."> 下，两份都预加载，切换只改属性（不闪屏）。
+     新增风格 = 新 skin-*.css + 这里一行 link + app.js STYLES 一项 + 下面脚本白名单一项。 -->
+<link rel="stylesheet" href="/skin-cassette.css">
+<link rel="stylesheet" href="/skin-punch.css">
+<script>
+  // 首帧前定好风格与明暗，避免先按默认皮肤画一帧再跳；按钮状态由 app.js initStyle/initTheme 同步
+  (function () {
+    var d = document.documentElement, s = null, t = null;
+    try { s = localStorage.getItem("qwenox-style"); t = localStorage.getItem("qwenox-theme"); } catch (e) { /* 隐私模式 */ }
+    if (s === "cassette" || s === "punch") d.dataset.style = s;
+    d.dataset.theme = t || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  })();
+</script>
 </head>
 <body>
-<!-- 整页是一台卡带终端：左 CRT（全部页面内容）、右走带模块、底部按键/指示灯条、铭牌。
-     app.js 只按 id / class 取元素，这里的外壳结构纯展示。 -->
+<!-- 整页是一台机器：左屏（全部页面内容）、右侧模块、底部按键/指示灯条、铭牌。
+     卡带风格 = CRT 绿屏 + 走带模块；打孔机风格 = 连续打印纸 + 读卡机/寄存器灯板。
+     app.js 只按 id / class 取元素，外壳结构纯展示；某一风格专用的装饰件带 .deco-<风格名>，其它风格下隐藏。
+     .card 上的 data-seq 是打孔机风格卡片右端序号区打的 8 个字符（app.js 生成孔位）。 -->
 <div class="chassis">
 
 <div class="crt">
@@ -21,28 +35,33 @@
       <span class="muted" id="overview-stamp"></span>
     </header>
     <div class="grid">
-      <div class="card">
+      <div class="card" data-seq="OVST0010">
         <h2 data-i18n="ov.status">服务状态</h2>
         <dl class="kv" id="ov-status"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
       </div>
-      <div class="card">
+      <div class="card" data-seq="OVMD0020">
         <h2 data-i18n="ov.model">模型配置</h2>
         <dl class="kv" id="ov-model"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
       </div>
-      <div class="card">
+      <div class="card" data-seq="OVMM0030">
         <h2 data-i18n="ov.mem">显存与内存</h2>
         <div id="mem-bars" class="bars"><span class="muted" data-i18n="common.loading">加载中…</span></div>
         <dl class="kv" id="ov-memory"></dl>
       </div>
-      <div class="card">
+      <div class="card" data-seq="OVPW0040">
         <h2 data-i18n="ov.power">功耗</h2>
         <dl class="kv" id="ov-power"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
+      </div>
+      <div class="card" data-seq="OVTP0050">
+        <h2 data-i18n="ov.temp">温度</h2>
+        <div id="temp-bars" class="bars"><span class="muted" data-i18n="common.loading">加载中…</span></div>
+        <p class="note muted" id="temp-note"></p>
       </div>
     </div>
   </section>
 
   <!-- ======================= 用量 ======================= -->
-  <!-- .fill 页撑满屏幕高度：页头/筛选/分页固定，只有表格或图表区域伸缩（见 style.css .page.fill） -->
+  <!-- .fill 页撑满屏幕高度：页头/筛选/分页固定，只有表格或图表区域伸缩（见 skin-*.css .page.fill） -->
   <section class="page fill hidden" id="page-usage">
     <header class="page-head">
       <h1 data-i18n="nav.usage">用量</h1>
@@ -122,7 +141,7 @@
       <h1 data-i18n="nav.sample">采样</h1>
       <span class="muted small" id="ovr-meta"></span>
     </header>
-    <div class="card">
+    <div class="card" data-seq="SMPL0010">
       <h2 data-i18n="ovr.title">采样 / 思考参数（服务端覆盖）</h2>
       <p class="note muted ovr-hint" data-i18n="ovr.hint"></p>
       <div class="table-wrap">
@@ -151,7 +170,7 @@
       <h1 data-i18n="nav.engine">引擎</h1>
       <span class="muted" id="eng-stamp"></span>
     </header>
-    <div class="card">
+    <div class="card" data-seq="ENGS0010">
       <h2 data-i18n="eng.status">引擎状态</h2>
       <dl class="kv" id="eng-status"><div class="kv-row muted" data-i18n="common.loading">加载中…</div></dl>
       <div class="head-tools eng-actions" id="eng-actions">
@@ -161,7 +180,7 @@
       <p class="note muted hidden" id="eng-nocontrol" data-i18n="eng.nocontrol"></p>
       <p class="note form-err hidden" id="eng-err"></p>
     </div>
-    <div class="card">
+    <div class="card" data-seq="ENGC0020">
       <h2 data-i18n="cfg.title">服务配置（service.conf）</h2>
       <p class="note muted cfg-hint" data-i18n="cfg.hint"></p>
       <div id="cfg-form"></div>
@@ -193,25 +212,37 @@
 </div>
 </div>
 
-<!-- 走带模块：引擎推理中时磁带轮转动，▶ / ■ 键随忙闲自动按下（纯指示，不可点） -->
+<!-- 右侧模块（纯指示，不可点）。卡带：推理中磁带轮转动，▶ / ■ 键随忙闲自动按下。
+     打孔机：推理中读卡机一张张吸卡、寄存器灯乱闪，空闲灯停在固定图案，未启动全灭；计数器 = 累计请求数（/reqstat/page total）。 -->
 <aside class="sidebar">
   <div class="brand">
-    <div class="reel-window" aria-hidden="true">
+    <div class="reel-window deco-cassette" aria-hidden="true">
       <svg class="reel reel-l" viewBox="-50 -50 100 100"><circle r="46" fill="#151513"/><circle r="38" fill="#3a2a20"/><circle r="45" fill="none" stroke="currentColor" stroke-width="5"/><g stroke="currentColor" stroke-width="7" stroke-linecap="round"><line x2="0" y2="-42"/><line x2="36.4" y2="21"/><line x2="-36.4" y2="21"/></g><circle r="11" fill="currentColor"/><circle r="4" fill="#151513"/></svg>
       <span class="tape-bridge"></span>
       <svg class="reel reel-r" viewBox="-50 -50 100 100"><circle r="46" fill="#151513"/><circle r="22" fill="#3a2a20"/><circle r="45" fill="none" stroke="currentColor" stroke-width="5"/><g stroke="currentColor" stroke-width="7" stroke-linecap="round"><line x2="0" y2="-42"/><line x2="36.4" y2="21"/><line x2="-36.4" y2="21"/></g><circle r="11" fill="currentColor"/><circle r="4" fill="#151513"/></svg>
     </div>
-    <div class="transport" aria-hidden="true">
+    <div class="transport deco-cassette" aria-hidden="true">
       <span class="tk">◀◀</span><span class="tk tk-play">▶</span><span class="tk tk-stop">■</span><span class="tk">▶▶</span>
+    </div>
+    <div class="reader deco-punch" aria-hidden="true">
+      <div class="reader-window">
+        <div class="hopper"><span class="dc"></span><span class="dc"></span><span class="dc"></span><span class="dc"></span><span class="dc"></span></div>
+      </div>
+      <div class="reader-caption"><span class="engr">CARD READ</span><span class="counter" id="reader-count">000000</span></div>
+    </div>
+    <div class="lampboard deco-punch" aria-hidden="true">
+      <div class="lamps" id="lamps"></div>
+      <span class="engr">REGISTER</span>
     </div>
     <div class="deck-label">
       <span class="brand-name">Qwen-Flash-Server</span>
-      <span class="deck-sub" aria-hidden="true">qwenox-api / gfx1151</span>
+      <span class="deck-sub deco-cassette" aria-hidden="true">qwenox-api / gfx1151</span>
+      <span class="deck-sub deco-punch" aria-hidden="true">SYSTEM/1151</span>
     </div>
   </div>
 </aside>
 
-<!-- 底部控制条：F 键 = 页面导航；指示灯排；两个拨杆开关 = 语言 / 明暗主题 -->
+<!-- 底部控制条：F 键 = 页面导航；指示灯排；旋钮 = 界面风格（每档一种）；两个拨杆开关 = 语言 / 明暗主题 -->
 <div class="console">
   <nav class="nav" id="nav">
     <button class="nav-btn" data-route="overview" data-i18n="nav.overview">总览</button>
@@ -227,6 +258,10 @@
     <span class="led"><i class="lamp lamp-warn" data-i18n-title="led.warn_tip" title="告警"></i>WARN</span>
   </div>
   <div class="sidebar-foot">
+    <button class="style-knob" id="style-btn" data-pos="cassette" data-i18n-title="hint.style" title="切换界面风格">
+      <span class="sk-scale"><span class="sk-a">CASSETTE</span><span class="sk-b">PUNCH</span></span>
+      <span class="sk-dial"><span class="sk-pointer"></span></span>
+    </button>
     <button class="hw-switch" id="lang-btn">
       <span class="hw-switch-slot"><span class="hw-switch-knob"></span></span>
       <span class="hw-switch-label">EN</span>
@@ -240,7 +275,8 @@
 
 <div class="plate" aria-hidden="true">
   <span class="plate-tag">GFX-1151</span>
-  <span class="plate-stripes"></span>
+  <span class="plate-stripes deco-cassette"></span>
+  <svg class="plate-tape deco-punch" id="plate-tape"></svg>
 </div>
 
 </div>

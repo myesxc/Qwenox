@@ -1,6 +1,6 @@
 # 高质量 hgn（8-bit dense overlay + imatrix 路由专家）
 
-目标：保持 hgn 格式（Windows 只能用 hgn，95 GiB arena 放不下 GGUF），把 KLD 从 0.163 降到接近
+目标：保持 hgn 格式（Windows 的 95 GiB arena 放不下 UD-Q4_K_XL），把 KLD 从 0.163 降到接近
 GGUF Q4_K_XL（0.049），速度尽量不掉。新文件都从原始 BF16 safetensors 重新量化，
 **格式、张量名与现有文件一致**，旧文件、旧二进制行为不变，换文件即可切换。
 

@@ -27,9 +27,17 @@
 //   !kPair (down): F32 out[slot][m], grid = (m / 128, tiles).
 // Rows of a tile past its count read zero activations and are not written.
 
+#include <type_traits>
+
+#include "../../gguf_iq3s_grid.h"
+
 namespace moegg {
 
 constexpr int kQ4K = 12, kQ5K = 13, kQ51 = 7, kQ80 = 8;  // gguf::Type values
+// IQ formats (UD-IQ4_XS GGUF): small-P GEMV only here; their WMMA path is the
+// LUT kernel family (27_kernels_moe_lut.inc, moe_ggx_up / moe_ggx_down).
+// Names differ from moelut::kIQ4NL/... (k_moe_lut uses both namespaces).
+constexpr int kIq4nl = 20, kIq3s = 21, kIq4xs = 23;
 constexpr uint32_t kHalfMagic = 0x64646464U;              // 1024.0 high bytes
 
 typedef _Float16 v16h __attribute__((ext_vector_type(16)));
@@ -41,10 +49,13 @@ __device__ __forceinline__ v8f wmma(v16h a, v16h b, v8f c) {
 
 template <int T>
 __host__ __device__ constexpr size_t row_bytes(size_t k) {
-  return T == kQ4K ? (k / 256) * 144
-       : T == kQ5K ? (k / 256) * 176
-       : T == kQ51 ? (k / 32) * 24
-                   : (k / 32) * 34;
+  return T == kQ4K   ? (k / 256) * 144
+       : T == kQ5K   ? (k / 256) * 176
+       : T == kQ51   ? (k / 32) * 24
+       : T == kIq4nl ? (k / 32) * 18
+       : T == kIq4xs ? (k / 256) * 136
+       : T == kIq3s  ? (k / 256) * 110
+                     : (k / 32) * 34;
 }
 
 __device__ __forceinline__ uint32_t header_byte(const uint4& h, uint32_t i) {
@@ -676,6 +687,118 @@ template <> struct UnitW<kQ80> {  // 34-byte blocks are only 2-byte aligned
   }
 };
 
+// --- IQ formats: one unit = one 32-element (sub-)block --------------------
+// kvalues_iq4nl as int8 bytes, looked up in registers: 4 nibble indices per
+// word -> v_perm from the low (0-7) / high (8-15) table halves, bit 3 picks.
+__device__ __forceinline__ uint32_t iq4_lookup4(uint32_t idx) {  // idx bytes 0..15
+  constexpr uint32_t T0 = 0xBFAD9881U, T1 = 0xF6EADDCFU;  // -127 -104 -83 -65 | -49 -35 -22 -10
+  constexpr uint32_t T2 = 0x26190D01U, T3 = 0x71594535U;  //   1   13  25  38 |  53  69  89 113
+  const uint32_t sel = idx & 0x07070707U;
+  const uint32_t lo = __builtin_amdgcn_perm(T1, T0, sel), hi = __builtin_amdgcn_perm(T3, T2, sel);
+  const uint32_t m = ((idx >> 3) & 0x01010101U) * 0xFFU;
+  return (hi & m) | (lo & ~m);
+}
+// 16 code bytes (element j = low nibble of byte j, j+16 = high nibble) . x
+// Explicit fmaf chain + __fmul_rn scale in the callers: the plain and the
+// expert-dedup GEMVs must round identically (bit-exact contract), which
+// implicit fp-contraction does not guarantee across kernels.
+__device__ __forceinline__ float iq4_dot32(const uint32_t* q, const float* __restrict__ x0) {
+  float acc = 0.f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const uint32_t vl = iq4_lookup4(q[i] & 0x0F0F0F0FU), vh = iq4_lookup4((q[i] >> 4) & 0x0F0F0F0FU);
+    const float4 xl = *(const float4*)(x0 + 4 * i);
+    const float4 xh = *(const float4*)(x0 + 16 + 4 * i);
+    acc = fmaf((float)(int8_t)(vl & 0xFF), xl.x, acc);
+    acc = fmaf((float)(int8_t)((vl >> 8) & 0xFF), xl.y, acc);
+    acc = fmaf((float)(int8_t)((vl >> 16) & 0xFF), xl.z, acc);
+    acc = fmaf((float)(int8_t)(vl >> 24), xl.w, acc);
+    acc = fmaf((float)(int8_t)(vh & 0xFF), xh.x, acc);
+    acc = fmaf((float)(int8_t)((vh >> 8) & 0xFF), xh.y, acc);
+    acc = fmaf((float)(int8_t)((vh >> 16) & 0xFF), xh.z, acc);
+    acc = fmaf((float)(int8_t)(vh >> 24), xh.w, acc);
+  }
+  return acc;
+}
+template <> struct UnitW<kIq4nl> {  // 18 B blocks: 2-byte aligned
+  float d;
+  uint32_t q[4];
+  int off;
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const uint16_t* blk = (const uint16_t*)(row + (size_t)u * 18);
+    d = __half2float(__ushort_as_half(blk[0]));
+#pragma unroll
+    for (int i = 0; i < 4; i++) q[i] = (uint32_t)blk[1 + 2 * i] | ((uint32_t)blk[2 + 2 * i] << 16);
+    off = u * 32;
+  }
+  __device__ __forceinline__ float dot(const float* __restrict__ x) const {
+    return __fmul_rn(d, iq4_dot32(q, x + off));
+  }
+};
+template <> struct UnitW<kIq4xs> {  // 136 B / 256: d, scales_h, scales_l[4], qs[128]
+  float dl;
+  uint32_t q[4];
+  int off;
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const int sb = u >> 3, ib = u & 7;
+    const uint8_t* blk = row + (size_t)sb * 136;
+    const uint2 hdr = *(const uint2*)blk;
+    const int ls = (int)((hdr.y >> (8 * (ib >> 1) + 4 * (ib & 1))) & 0xFU) |
+                   (int)(((hdr.x >> (16 + 2 * ib)) & 3U) << 4);
+    dl = __half2float(__ushort_as_half((unsigned short)(hdr.x & 0xFFFF))) * (float)(ls - 32);
+    const uint2* qp = (const uint2*)(blk + 8 + 16 * ib);
+    const uint2 a = qp[0], b = qp[1];
+    q[0] = a.x; q[1] = a.y; q[2] = b.x; q[3] = b.y;
+    off = u * 32;
+  }
+  __device__ __forceinline__ float dot(const float* __restrict__ x) const {
+    return __fmul_rn(dl, iq4_dot32(q, x + off));
+  }
+};
+// IQ3_S codebook (llama.cpp iq3s_grid, MIT): divergent indices are plain
+// vector loads on AMD (L1-resident 2 KiB), not serialized like a CUDA
+// constant cache.
+__constant__ uint32_t c_iq3s_grid[512] = GGUF_IQ3S_GRID_INIT;
+template <> struct UnitW<kIq3s> {  // 110 B / 256: d, qs[64], qh[8], signs[32], scales[4]
+  float db;
+  uint32_t g[8];  // grid words, element order (g[2l] = 8l..8l+3, g[2l+1] = 8l+4..8l+7)
+  uint32_t sg;    // sign bits, element order (bit j = element j of the 32)
+  int off;
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const int sb = u >> 3, ib = u & 7;
+    const uint8_t* blk = row + (size_t)sb * 110;  // 2-byte aligned
+    const uint16_t* b16 = (const uint16_t*)blk;
+    const float d = __half2float(__ushort_as_half(b16[0]));
+    const uint32_t sc = blk[106 + (ib >> 1)];
+    db = d * (float)(1 + 2 * ((sc >> (4 * (ib & 1))) & 0xF));
+    const uint32_t h = blk[66 + ib];
+    const uint16_t* qs = b16 + 1 + 4 * ib;
+    sg = (uint32_t)b16[37 + 2 * ib] | ((uint32_t)b16[38 + 2 * ib] << 16);
+#pragma unroll
+    for (int l = 0; l < 4; l++) {
+      const uint32_t q2 = qs[l];
+      g[2 * l] = c_iq3s_grid[(q2 & 0xFF) | ((h << (8 - 2 * l)) & 256)];
+      g[2 * l + 1] = c_iq3s_grid[(q2 >> 8) | ((h << (7 - 2 * l)) & 256)];
+    }
+    off = u * 32;
+  }
+  __device__ __forceinline__ float dot(const float* __restrict__ x) const {
+    const float* x0 = x + off;
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const float4 xv = *(const float4*)(x0 + 4 * i);
+      const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const uint32_t xb = __float_as_uint(xs[b]) ^ (((sg >> (4 * i + b)) & 1U) << 31);
+        acc = fmaf((float)((g[i] >> (8 * b)) & 0xFFU), __uint_as_float(xb), acc);
+      }
+    }
+    return __fmul_rn(db, acc);
+  }
+};
+
 // dot(row unit u, x[unit u elements]) for one weight row in raw GGUF layout
 template <int T>
 __device__ __forceinline__ float unit_dot(const uint8_t* __restrict__ row, int u,
@@ -746,15 +869,20 @@ void k_moe_gg_gemv_dn(const uint8_t* __restrict__ wd, const float* __restrict__ 
   }
 }
 
-// --- Expert dedup for 2 <= P <= 8 (spec verify): tokens of one step share
-// many experts; read each unique expert once for all its (token, slot) pairs.
-// meta (ints): [0] unique count U; [1+u] expert; [1+NM+u] member count;
-// [1+2NM+8u+j] member j = tok*kpt+s (ascending). NM = 8*kpt max.
+// --- Expert dedup for 2 <= P <= 48 (spec verify, batched verify / drafts):
+// tokens of one step share many experts; read each unique expert once for all
+// its (token, slot) pairs. meta (ints): [0] unique count U; [1+u] expert;
+// [1+NM+u] member count; [1+2NM+MP*u+j] member j = tok*kpt+s (ascending).
+// NM = MP*kpt max (MP = kUqMaxP: an expert has at most one slot per token).
+// The kernels walk an expert's members in chunks of kUqChunk (registers);
+// each member's arithmetic is the plain GEMV's (same unit order and dot), so
+// results are bit-identical to k_moe_gg_gemv_gu / _dn for any P and batch
+// composition (row-invariant, like the P = 1 decode GEMV).
 namespace moegg {
-constexpr int kUqMaxP = 8, kUqNM = kUqMaxP * 10;
+constexpr int kUqMaxP = 48, kUqNM = kUqMaxP * 10, kUqChunk = 8;
 constexpr int kUqInts = 1 + 2 * kUqNM + kUqMaxP * kUqNM;
 }  // namespace moegg
-__launch_bounds__(128) __global__
+__launch_bounds__(512) __global__
 void k_moe_gg_uniq(const int* __restrict__ ids, int* __restrict__ meta, int P, int kpt,
                    int id_stride) {
   constexpr int NM = moegg::kUqNM;
@@ -793,7 +921,7 @@ __launch_bounds__(256) __global__
 void k_moe_gg_gemv_gu_uq(const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,
                          const float* __restrict__ x, const int* __restrict__ meta,
                          float* __restrict__ hid, int m, int k, int kpt) {
-  constexpr int NM = moegg::kUqNM, MP = moegg::kUqMaxP;
+  constexpr int NM = moegg::kUqNM, MP = moegg::kUqMaxP, CH = moegg::kUqChunk;
   const int gw = (int)((blockIdx.x * blockDim.x + threadIdx.x) / warpSize);
   const int u = gw / m, r = gw - u * m;
   if (u >= meta[0]) return;
@@ -802,31 +930,34 @@ void k_moe_gg_gemv_gu_uq(const uint8_t* __restrict__ wg, const uint8_t* __restri
   const int lane = threadIdx.x % warpSize, half = lane >> 4, l16 = lane & 15;
   const size_t rb = moegg::row_bytes<T>((size_t)k);
   const uint8_t* w = (half ? wu : wg) + ((size_t)e * m + r) * rb;
-  int sl[MP];
-  const float* xp[MP];
-  float acc[MP];
-#pragma unroll
-  for (int j = 0; j < MP; j++) {
-    sl[j] = mem[j < cnt ? j : 0];
-    xp[j] = x + (size_t)(sl[j] / kpt) * k;
-    acc[j] = 0.f;
-  }
   const int nu = k / moegg::unit_elems<T>();
-  for (int uu = l16; uu < nu; uu += 16) {
-    moegg::UnitW<T> wv;
-    wv.load(w, uu);
+  for (int c0 = 0; c0 < cnt; c0 += CH) {  // member chunks (cnt is wave-uniform)
+    const int cn = min(CH, cnt - c0);
+    int sl[CH];
+    const float* xp[CH];
+    float acc[CH];
 #pragma unroll
-    for (int j = 0; j < MP; j++)
-      if (j < cnt) acc[j] += wv.dot(xp[j]);
-  }
+    for (int j = 0; j < CH; j++) {
+      sl[j] = mem[c0 + (j < cn ? j : 0)];
+      xp[j] = x + (size_t)(sl[j] / kpt) * k;
+      acc[j] = 0.f;
+    }
+    for (int uu = l16; uu < nu; uu += 16) {
+      moegg::UnitW<T> wv;
+      wv.load(w, uu);
 #pragma unroll
-  for (int j = 0; j < MP; j++) {
-    if (j >= cnt) break;  // cnt is wave-uniform
-    float a = acc[j];
+      for (int j = 0; j < CH; j++)
+        if (j < cn) acc[j] += wv.dot(xp[j]);
+    }
 #pragma unroll
-    for (int off = 8; off > 0; off >>= 1) a += __shfl_down_sync(~0ull, a, off, 16);
-    const float up = __shfl_sync(~0ull, a, 16);
-    if (lane == 0) hid[(size_t)sl[j] * m + r] = up * a * moegg::sigmoidf_(a);
+    for (int j = 0; j < CH; j++) {
+      if (j >= cn) break;
+      float a = acc[j];
+#pragma unroll
+      for (int off = 8; off > 0; off >>= 1) a += __shfl_down_sync(~0ull, a, off, 16);
+      const float up = __shfl_sync(~0ull, a, 16);
+      if (lane == 0) hid[(size_t)sl[j] * m + r] = up * a * moegg::sigmoidf_(a);
+    }
   }
 }
 
@@ -836,7 +967,7 @@ __launch_bounds__(256) __global__
 void k_moe_gg_gemv_dn_uq(const uint8_t* __restrict__ wd, const float* __restrict__ hid,
                          const int* __restrict__ meta, float* __restrict__ pairs, int m,
                          int k) {
-  constexpr int NM = moegg::kUqNM, MP = moegg::kUqMaxP, RPW = 32 / LPR;
+  constexpr int NM = moegg::kUqNM, MP = moegg::kUqMaxP, CH = moegg::kUqChunk, RPW = 32 / LPR;
   const int gw = (int)((blockIdx.x * blockDim.x + threadIdx.x) / warpSize);
   const int rpt = (m + RPW - 1) / RPW;
   const int u = gw / rpt;
@@ -848,28 +979,31 @@ void k_moe_gg_gemv_dn_uq(const uint8_t* __restrict__ wd, const float* __restrict
   const int* mem = meta + 1 + 2 * NM + MP * u;
   const size_t rb = moegg::row_bytes<T>((size_t)k);
   const uint8_t* w = wd + ((size_t)e * m + (live ? r : 0)) * rb;
-  int sl[MP];
-  float acc[MP];
-#pragma unroll
-  for (int j = 0; j < MP; j++) {
-    sl[j] = mem[j < cnt ? j : 0];
-    acc[j] = 0.f;
-  }
   const int nu = k / moegg::unit_elems<T>();
-  for (int uu = ll; uu < nu; uu += LPR) {
-    moegg::UnitW<T> wv;
-    wv.load(w, uu);
+  for (int c0 = 0; c0 < cnt; c0 += CH) {  // member chunks (cnt is wave-uniform)
+    const int cn = min(CH, cnt - c0);
+    int sl[CH];
+    float acc[CH];
 #pragma unroll
-    for (int j = 0; j < MP; j++)
-      if (j < cnt) acc[j] += wv.dot(hid + (size_t)sl[j] * k);
-  }
+    for (int j = 0; j < CH; j++) {
+      sl[j] = mem[c0 + (j < cn ? j : 0)];
+      acc[j] = 0.f;
+    }
+    for (int uu = ll; uu < nu; uu += LPR) {
+      moegg::UnitW<T> wv;
+      wv.load(w, uu);
 #pragma unroll
-  for (int j = 0; j < MP; j++) {
-    if (j >= cnt) break;
-    float a = acc[j];
+      for (int j = 0; j < CH; j++)
+        if (j < cn) acc[j] += wv.dot(hid + (size_t)sl[j] * k);
+    }
 #pragma unroll
-    for (int off = LPR / 2; off > 0; off >>= 1) a += __shfl_down_sync(~0ull, a, off, LPR);
-    if (ll == 0 && live) pairs[(size_t)sl[j] * m + r] = a;
+    for (int j = 0; j < CH; j++) {
+      if (j >= cn) break;
+      float a = acc[j];
+#pragma unroll
+      for (int off = LPR / 2; off > 0; off >>= 1) a += __shfl_down_sync(~0ull, a, off, LPR);
+      if (ll == 0 && live) pairs[(size_t)sl[j] * m + r] = a;
+    }
   }
 }
 // out[tok][r] = sum_s ws[tok][s] * pairs[tok*KPT+s][r], expert-rank order
@@ -890,50 +1024,66 @@ __global__ void k_moe_gg_pairs_sum(const float* __restrict__ pairs, const float*
 #endif
 // Small-P GEMV path: x F32 [P][d] -> out F32 [P][d] (overwritten), hid =
 // F32 scratch [P*10][mid]. topk must be 10. false = unsupported types.
+namespace moegg {
+// gate/up and down types with GEMV instances (type checks by the caller)
+inline bool gemv_gu_ok(int t) {
+  return t == kQ4K || t == kQ5K || t == kQ80 || t == kIq4xs || t == kIq3s;
+}
+inline bool gemv_dn_ok(int t) { return t == kQ51 || t == kQ80 || t == kIq4nl; }
+// f(std::integral_constant<int, T>) for the runtime type t (one of the gemv_*_ok sets)
+template <class F>
+inline void with_gu_type(int t, F&& f) {
+  switch (t) {
+    case kQ4K: f(std::integral_constant<int, kQ4K>{}); break;
+    case kQ5K: f(std::integral_constant<int, kQ5K>{}); break;
+    case kQ80: f(std::integral_constant<int, kQ80>{}); break;
+    case kIq4xs: f(std::integral_constant<int, kIq4xs>{}); break;
+    default: f(std::integral_constant<int, kIq3s>{}); break;
+  }
+}
+template <class F>
+inline void with_dn_type(int t, F&& f) {
+  switch (t) {
+    case kQ51: f(std::integral_constant<int, kQ51>{}); break;
+    case kQ80: f(std::integral_constant<int, kQ80>{}); break;
+    default: f(std::integral_constant<int, kIq4nl>{}); break;
+  }
+}
+}  // namespace moegg
+
 static bool moe_gg_gemv(int tgu, int tdn, const uint8_t* gate, const uint8_t* up,
                         const uint8_t* down, const float* x, const int* ids, const float* ws,
                         float* hid, float* out, int P, int d, int mid, int id_stride,
                         hipStream_t st, int* uq_meta = nullptr, float* uq_pairs = nullptr) {
   constexpr int KPT = 10;
   if (d % 256 || mid % 32) return false;
+  if (!moegg::gemv_gu_ok(tgu) || !moegg::gemv_dn_ok(tdn)) return false;
+  constexpr int LPR = MOE_GG_DN_LPR, RPW = 32 / LPR;
   if (uq_meta && uq_pairs && P >= 2 && P <= moegg::kUqMaxP) {
     // expert dedup (meta/pairs scratch: kUqInts ints, P*KPT*d floats)
-    if ((tgu != moegg::kQ4K && tgu != moegg::kQ5K && tgu != moegg::kQ80) ||
-        (tdn != moegg::kQ51 && tdn != moegg::kQ80))
-      return false;
-    k_moe_gg_uniq<<<1, 128, 0, st>>>(ids, uq_meta, P, KPT, id_stride);
+    k_moe_gg_uniq<<<1, 512, 0, st>>>(ids, uq_meta, P, KPT, id_stride);  // P*KPT <= 480
     const unsigned gb = (unsigned)(((size_t)P * KPT * mid + 7) / 8);
-    if (tgu == moegg::kQ4K)
-      k_moe_gg_gemv_gu_uq<moegg::kQ4K><<<gb, 256, 0, st>>>(gate, up, x, uq_meta, hid, mid, d, KPT);
-    else if (tgu == moegg::kQ5K)
-      k_moe_gg_gemv_gu_uq<moegg::kQ5K><<<gb, 256, 0, st>>>(gate, up, x, uq_meta, hid, mid, d, KPT);
-    else
-      k_moe_gg_gemv_gu_uq<moegg::kQ80><<<gb, 256, 0, st>>>(gate, up, x, uq_meta, hid, mid, d, KPT);
-    constexpr int LPR = MOE_GG_DN_LPR, RPW = 32 / LPR;
+    moegg::with_gu_type(tgu, [&](auto tc_) {
+      constexpr int T = decltype(tc_)::value;
+      k_moe_gg_gemv_gu_uq<T><<<gb, 256, 0, st>>>(gate, up, x, uq_meta, hid, mid, d, KPT);
+    });
     const unsigned db = (unsigned)(((size_t)P * KPT * ((d + RPW - 1) / RPW) + 7) / 8);
-    if (tdn == moegg::kQ51)
-      k_moe_gg_gemv_dn_uq<moegg::kQ51, LPR><<<db, 256, 0, st>>>(down, hid, uq_meta, uq_pairs, d, mid);
-    else
-      k_moe_gg_gemv_dn_uq<moegg::kQ80, LPR><<<db, 256, 0, st>>>(down, hid, uq_meta, uq_pairs, d, mid);
+    moegg::with_dn_type(tdn, [&](auto tc_) {
+      constexpr int T = decltype(tc_)::value;
+      k_moe_gg_gemv_dn_uq<T, LPR><<<db, 256, 0, st>>>(down, hid, uq_meta, uq_pairs, d, mid);
+    });
     k_moe_gg_pairs_sum<KPT><<<dim3((d + 255) / 256, P), 256, 0, st>>>(uq_pairs, ws, out, d, id_stride);
     return true;
   }
   const unsigned gu_blocks = (unsigned)(((size_t)P * KPT * mid + 7) / 8);
-  if (tgu == moegg::kQ4K)
-    k_moe_gg_gemv_gu<moegg::kQ4K><<<gu_blocks, 256, 0, st>>>(gate, up, x, ids, hid, mid, d, KPT, id_stride, P);
-  else if (tgu == moegg::kQ5K)
-    k_moe_gg_gemv_gu<moegg::kQ5K><<<gu_blocks, 256, 0, st>>>(gate, up, x, ids, hid, mid, d, KPT, id_stride, P);
-  else if (tgu == moegg::kQ80)
-    k_moe_gg_gemv_gu<moegg::kQ80><<<gu_blocks, 256, 0, st>>>(gate, up, x, ids, hid, mid, d, KPT, id_stride, P);
-  else
-    return false;
-  constexpr int LPR = MOE_GG_DN_LPR, RPW = 32 / LPR;
+  moegg::with_gu_type(tgu, [&](auto tc_) {
+      constexpr int T = decltype(tc_)::value;
+    k_moe_gg_gemv_gu<T><<<gu_blocks, 256, 0, st>>>(gate, up, x, ids, hid, mid, d, KPT, id_stride, P);
+  });
   const unsigned dn_blocks = (unsigned)(((size_t)P * ((d + RPW - 1) / RPW) + 7) / 8);
-  if (tdn == moegg::kQ51)
-    k_moe_gg_gemv_dn<moegg::kQ51, LPR, KPT><<<dn_blocks, 256, 0, st>>>(down, hid, ids, ws, out, d, mid, id_stride, P);
-  else if (tdn == moegg::kQ80)
-    k_moe_gg_gemv_dn<moegg::kQ80, LPR, KPT><<<dn_blocks, 256, 0, st>>>(down, hid, ids, ws, out, d, mid, id_stride, P);
-  else
-    return false;
+  moegg::with_dn_type(tdn, [&](auto tc_) {
+      constexpr int T = decltype(tc_)::value;
+    k_moe_gg_gemv_dn<T, LPR, KPT><<<dn_blocks, 256, 0, st>>>(down, hid, ids, ws, out, d, mid, id_stride, P);
+  });
   return true;
 }

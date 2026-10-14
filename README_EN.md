@@ -1,23 +1,31 @@
-# gfx1151-engine
+# Qwenox
 
 ![Strix Halo — Qwen3.8-Flash-Next](media/strix_banner_21x9_v2.png)
 
 *中文版:[README.md](README.md)*
 
-A local inference engine that runs a 177B MoE model on a single AMD Strix
-Halo APU (gfx1151). Target model: Qwen3.8-Flash-Next (qwen4_exp architecture)
-and fine-tunes with the same architecture.
+Qwenox is a local inference engine for Qwen3.8-Flash-Next (177B MoE, qwen4_exp architecture). It is written
+for AMD Strix Halo (Ryzen AI Max+ 395, gfx1151) and similar 128 GB unified-memory APUs, and runs on both
+Linux and Windows. It serves an OpenAI-compatible API (streaming, tool calls, image input) and a web
+console.
 
-The routed experts are stored in host memory in 4-bit quantization and read
-directly by the GPU kernels — no large VRAM needed. The memory-resident
-weights are ~67–77 GiB depending on the weight format (the PLE n-gram table
-stays on disk and is read on demand); a machine with 122 GiB of RAM can serve
-a 256K context.
+Key design points:
+
+- **The weights fit.** Routed experts are 4-bit and read directly by the GPU kernels. The PLE n-gram table
+  (27–48 GiB) stays on disk and is read on demand, so it takes no memory. Resident weights are 60–77 GiB
+  depending on the weight file; the remaining memory holds a 256K context.
+- **Speculative decoding.** ngram drafting first, with the MTP draft head as fallback. Greedy is checked
+  token by token; sampling resamples against the target distribution, so the output distribution matches
+  non-speculative decoding. On by default, no flags needed.
+- **No repeated prefill.** A paged KV pool plus two levels of prompt cache (in-memory checkpoints at message
+  boundaries, and SSD snapshots that survive restarts). Edit-and-resend, multi-turn continuation and
+  switching between conversations reuse what was already computed.
 
 ## Measured Performance
 
-Development machine: **GMK EVO-X2 (AMD Ryzen AI Max+ 395, Strix Halo /
-gfx1151)**, 122 GiB RAM:
+Development machine: **GMK EVO-X2 (AMD Ryzen AI Max+ 395, Strix Halo / gfx1151)**, 122 GiB RAM.
+
+Linux (ROCm 10.1, production config, PREFILL_CHUNK=16384):
 
 | Metric | Value |
 | --- | --- |
@@ -25,460 +33,286 @@ gfx1151)**, 122 GiB RAM:
 | Prefill (128K context) | ~1650 tok/s (measured 10-07) |
 | Prefill (256K context) | ~1590 native, ~1580 with YaRN factor 2 (~0.5% overhead, measured 10-07) |
 | Decode (speculative, greedy, γ=4) | ~51 tok/s at 8K, ~50 at 64K (real text, 10-07) |
-| Decode (no speculation) | ~34 tok/s at 8K (measured 10-07, hgn standard weights; HQ/GGUF read more per token, ~16% slower) |
+| Decode (no speculation) | ~34 tok/s at 8K (measured 10-07, hgn v2 weights; weights with 8-bit dense read more per token, ~12–16% slower) |
 | Average power draw | ~120 W |
 | Peak (instantaneous) power draw | ~130 W (bursts for a few seconds, then settles back to ~120 W) |
 
-Speculative decode varies strongly with text repetitiveness: the row above was
-measured on real-text prompts; highly repetitive content (code, template text)
-hits the chain drafter well and exceeds 60 tok/s in the same configuration;
-sampling (adaptive γ) is slightly lower than greedy. Numbers vary with the
-weight format (GGUF / hgn); ROCm 7.14 and 10.1 measured identical. All dates
-are in 2026; test environment ROCm 10.1, production config
-(PREFILL_CHUNK=16384).
+Windows (same machine, 96 GiB GPU memory set in the BIOS, tray production config, prefill chunk 8192, measured
+10-13):
 
-## Weight Formats and Quality
+| Metric | hgn v2 | GGUF UD-IQ4_XS + MTP |
+| --- | --- | --- |
+| Prefill (32K) | ~1560 tok/s | ~1440 tok/s |
+| Decode (speculative, 2K prompt) | 58.5 tok/s | 46.8 tok/s |
+| Decode (no speculation) | 31.4 tok/s | 27.7 tok/s |
+| Cold start (whole weight file read into VRAM) | ~35 s | ~50–60 s |
 
-The engine supports two weight formats. Service, API and speculative
-decoding are identical; switch by using the other launcher:
+Speculative decode speed depends heavily on how repetitive the text is. The tables use real-text prompts;
+highly repetitive content such as code or templates gets a high draft hit rate and exceeds 60 tok/s in the
+same configuration; sampling (adaptive γ) is slightly below greedy. All dates are 2026; on Linux, ROCm 7.14
+and 10.1 measured identical. Multi-request numbers are in "Concurrency".
 
-| | hgn standard | hgn high quality (HQ) | GGUF UD-Q4_K_XL |
-| --- | --- | --- | --- |
-| Files | current default (`qwen38-flash-next-v2.hgn` + ngram/MTP) | converted from the original weights, see [HGN-HQ.md](docs/HGN-HQ.md) (Chinese) | released by Unsloth, the same files llama.cpp uses |
-| Routed experts | 4-bit (q4cp) | 4-bit (q4cp, imatrix-weighted) | mostly Q4_K / Q5_1 |
-| Dense (attention, GDN, shared expert, embed, lm_head) | 4-bit | 8-bit (q8g32 overlay) | 8-bit (Q8_0) |
-| KLD vs BF16 (lower is better) | 0.163 | **0.0558** | 0.0511 |
-| top1 agreement with BF16 | 86.8% | 92.4% | 92.6% |
-| Resident weights bpw / size | 4.55 / 66.6 GiB | 4.70 / 68.8 GiB | 5.25 / 76.9 GiB |
-| Prefill (8K prompt, chunk 16384) | ~1730–1750 tok/s | about the same | about the same |
-| Decode (no speculation) | ~34 tok/s | ~29 tok/s | ~29 tok/s |
-| Launch | `start_hgn.sh` | `start_hgn.sh` (set `MODEL_FILE` / `OVERLAY_FILE`) | `start_gguf.sh` |
-| Windows | yes | yes (not yet measured) | no |
+## Supported Weights
 
-- KLD: BF16 reference, wikitext-2, 64 chunks × 512, measured the same way as
-  unsloth / llama.cpp (see [KLD.md](docs/KLD.md), Chinese); llama.cpp on the same
-  GGUF gives 0.049.
-- Almost the whole quality gap comes from the dense bit width: 8-bit dense
-  takes KLD from 0.163 to 0.063, imatrix-weighted experts bring it to 0.0558.
-  The cost is more bytes read per decode token, ~16% slower decode (same as
-  GGUF); prefill is unaffected.
-- The two performance rows were measured 2026-10-07 on hgn standard (v2
-  weights); the HQ / GGUF columns follow from the rule above (prefill is
-  insensitive to bit width, decode is ~16% slower).
-- Resident weights exclude the PLE n-gram table (hgn fp8 47.7 GiB, GGUF
-  IQ4_NL 26.8 GiB), which stays on disk and is read on demand.
-  `python3 tools/bpw.py` reports bpw per category for each file (reads headers
-  only, a few seconds).
-- The default configuration is still hgn standard. The HQ files pass
-  `tools/hq_verify.sh`; deployment is described in section 6 of
-  [HGN-HQ.md](docs/HGN-HQ.md).
+| Weights | Platform | Quality (KLD vs BF16, lower is better) | Download / resident | When to use |
+| --- | --- | --- | --- | --- |
+| **hgn v2** (recommended) | Linux, Windows | 0.107 | ~112 GiB / 62.1 GiB | Default: fastest, best results in practice |
+| GGUF UD-Q4_K_XL | Linux | 0.051 | 104 GiB / ~77 GiB | Better quality on Linux |
+| GGUF UD-IQ4_XS | Windows (Linux untested) | 0.100 | 87 GiB / 60.4 GiB (63.0 with MTP) | Only to save VRAM, and only without MTP; quality on par with v2, slower than v2 |
+| hgn w4b | Linux, Windows | 0.163 | 118 GiB / 68.0 GiB | Already-downloaded older files; not recommended for new downloads |
 
-## Features
+- Resident memory is the weight footprint measured on Windows, including the MTP draft head and excluding the PLE
+  n-gram table, which stays on disk (hgn 47.7 GiB, GGUF 26.8 GiB); that is why the download is larger. The v2 body
+  already contains the MTP draft head, so the separate `mtp.hgn` costs no extra VRAM; the GGUF MTP head is a
+  separate file and adds to the total.
+- UD-Q4_K_XL has lower KLD than v2 mainly because its dense part (attention, GDN, shared expert, lm_head) is
+  8-bit while v2's is 4-bit; the cost is twice the dense bytes per token, so non-speculative decode is ~16% slower.
+- UD-IQ4_XS stores most routed experts as IQ3_S, narrower than v2's 4-bit, with 8-bit dense. Its only advantage
+  is lower VRAM use, and only without MTP: without MTP it uses 3.2 GiB less than v2, with the Q8_0 MTP draft head
+  it uses 1.3 GiB more, and without MTP decode is only about half the speculative speed. Quality is roughly on par
+  with v2: KLD 0.100 vs 0.107 and top-1 agreement 89.7% vs 88.8% are slightly better, while PPL (3.44 vs 3.42) and
+  the worst-0.1% KLD (3.11 vs 2.91) are slightly worse. It is slower than v2: decode ~12%, prefill ~6%, and
+  multi-request throughput ~15% lower.
+- KLD uses wikitext-2, 64 chunks × 512, the same method as unsloth / llama.cpp; see [KLD.md](docs/KLD.md).
+- Other quant levels in the Unsloth repo (IQ1 / IQ3_XXS / Q2 / Q3 / Q5 / Q6 etc.) are not supported.
 
-- **Speculative decoding chain**: ngram drafts first, MTP as fallback, with
-  round-by-round fallback; greedy does bit-exact comparison, sampling
-  resamples and compares against the target distribution, so the output
-  distribution is identical to serial decoding. Enabled by default, no
-  parameters needed; the draft length γ is chosen per mode (fixed 4 for
-  greedy, adaptive by acceptance rate for sampling) and can be pinned with
-  `MTP_GAMMA=1-8`. Highly repetitive content (code comments, template
-  text) shows significant measured speedups.
-- **Standalone 8-bit MTP draft weights** sidecar, with a higher acceptance
-  rate than the built-in 4-bit draft head.
-- **Vision**: supports image input (OpenAI `image_url`), with KV reuse
-  across turns.
-- **OpenAI-compatible API**: streaming, tool calling,
-  `/v1/chat/completions`.
-- **Native 256K / YaRN 512K context**, with native RoPE as the default and
-  optional YaRN; a paged KV pool and two-tier prompt caching:
-  in-RAM checkpoints at message boundaries (edit-and-resend replies
-  instantly) plus KV snapshots recovered across restarts.
-- **Concurrent requests**: multiple requests share one paged KV pool (4
-  slots by default, 256K total — similar to llama.cpp's shared context);
-  the GPU round-robins between requests and each request's output is
-  bit-identical to running alone; long-prompt prefill is chunked to yield
-  the GPU, capping other sessions' worst stall at ~0.6 s. Configuration
-  and semantics in [CONCURRENCY.md](docs/CONCURRENCY.md) (Chinese).
-- **Two weight formats**: the native `.hgn` (Linux / Windows) and llama.cpp
-  GGUF (Unsloth UD-Q4_K_XL, Linux); comparison above.
-- **Model conversion tool**: HF safetensors → `.hgn`. The default output is
-  the high-quality variant (8-bit dense overlay + weighted 4-bit experts); a
-  llama.cpp-format imatrix is used if you have one, and conversion works
-  without one too. Usable for your own fine-tunes of the same architecture
-  (see [HGN-HQ.md](docs/HGN-HQ.md), [CONVERT_EN.md](docs/CONVERT_EN.md)).
+Downloads use the Hugging Face CLI (`pip install -U huggingface_hub`). The commands below put everything
+into the project's `models/` directory, which is where the launchers look by default.
 
-## Requirements
+### hgn v2
 
-- Linux + ROCm (HIP 7.x), GPU architecture `gfx1151`; or Windows + AMD GPU
-  driver (the GPU needs VRAM carved out in BIOS), see the "Windows" section
-- Available memory ≥ 100 GiB (pinned (page-locked) weights: ~68 GiB for hgn,
-  ~80 GiB for GGUF, plus KV)
-- Build dependencies: rocBLAS, hipBLASLt, rocPRIM; the API frontend also
-  needs libpng, libjpeg, libwebp; nlohmann/json is vendored in the repository
+Source: [peonist-ai/halogen-qwen3.8-flash-next](https://huggingface.co/peonist-ai/halogen-qwen3.8-flash-next)
+(published by halogen, loaded directly by this engine).
+
+| File | Size | Notes |
+| --- | --- | --- |
+| `qwen38-flash-next-v2.hgn` | 62.1 GiB | Main model |
+| `qwen38-flash-next-ngram.hgn` | 47.7 GiB | PLE n-gram table, read from disk on demand |
+| `qwen38-flash-next-mtp.hgn` | 1.4 GiB | 8-bit MTP draft head |
+| `qwen38-flash-next-vision.hgn` | 0.84 GiB | Vision tower; skip it for text-only and set `VISION_FILE=""` |
+| `tokenizer/` | — | Tokenizer |
+
+```bash
+hf download peonist-ai/halogen-qwen3.8-flash-next --local-dir ./models --include \
+  qwen38-flash-next-v2.hgn qwen38-flash-next-ngram.hgn \
+  qwen38-flash-next-mtp.hgn qwen38-flash-next-vision.hgn "tokenizer/*"
+```
+
+The other files in that repo (`w4b`, `overlay`, `ht43`) are not needed.
+
+### GGUF
+
+Source: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF).
+These are the same files llama.cpp uses; if you already have them, symlink them into `models/`.
+
+| File | Size | Notes |
+| --- | --- | --- |
+| `UD-Q4_K_XL/…-0000{1..4}-of-00004.gguf` | 103.7 GiB | Main model (Linux), all 4 shards |
+| `UD-IQ4_XS/…-0000{1..3}-of-00003.gguf` | 87.2 GiB | Main model (Windows), all 3 shards |
+| `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | 2.6 GiB | MTP draft head |
+| `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (repo root) | 3.9 GiB | MTP draft head, either this or the previous one; the Q4_K_M version is not supported |
+| `mmproj-BF16.gguf` | 0.85 GiB | Vision tower; `qwen38-flash-next-vision.hgn` from the hgn repo also works |
+
+The GGUF repo has no `tokenizer.json`; take it from the original model repo (it is the same file as in the
+hgn repo's `tokenizer/`).
+
+```bash
+# Linux: UD-Q4_K_XL
+hf download unsloth/Qwen3.8-Flash-Next-GGUF --local-dir ./models --include \
+  "UD-Q4_K_XL/*" MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf mmproj-BF16.gguf
+# Windows: UD-IQ4_XS (vision tower from the hgn repo; this is the combination tested on Windows)
+hf download unsloth/Qwen3.8-Flash-Next-GGUF --local-dir ./models --include \
+  "UD-IQ4_XS/*" mtp-Qwen3.8-Flash-Next-Q8_0.gguf
+hf download peonist-ai/halogen-qwen3.8-flash-next --local-dir ./models --include \
+  qwen38-flash-next-vision.hgn
+# Both need the tokenizer
+hf download Qwen/Qwen3.8-Flash-Next tokenizer.json --local-dir ./models/tokenizer
+```
+
+The shards land in subdirectories; put their paths into `service.conf` as described in "Quick Start".
 
 ## Quick Start
 
-```bash
-bash build.sh        # Build all required artifacts, output goes to build/
-bash start_hgn.sh    # hgn weights: load the model and start the service (reads service.conf)
-bash start_gguf.sh   # or GGUF weights (Unsloth UD-Q4_K_XL, the same files llama.cpp uses)
-```
+Linux and Windows share the same source tree, the same `models/` directory and the same `service.conf`.
+Download the weights as described above, put their paths into `service.conf`, then build and start for your
+OS. Once running, the API is at `http://<host>:8731/v1` (standard OpenAI interface, streaming supported), and
+`http://<host>:8731/` in a browser opens the console.
 
-Both launchers read weights from `./models` and list any missing files before
-exiting; configuration is centralized in `service.conf` (one section each for
-hgn and GGUF; GGUF details in [GGUF.md](docs/GGUF.md)). See [QUICKSTART_EN.md](docs/QUICKSTART_EN.md)
-for details.
+### Weight paths
 
-For repeatable standalone performance measurements, build and run the
-command-line benchmark described in [BENCHMARK_EN.md](docs/BENCHMARK_EN.md):
-`bash build.sh` on Linux or `bash build_win.sh` on Windows. Each default build
-produces all required platform artifacts, including the engine, API, and
-benchmark; Windows also builds the native launcher. It loads only the model
-selected from `service.conf`, benchmarks all
-`data/qsa-oracle/*.tokens` prompts for prefill, and reports TG speed plus MTP
-acceptance for Python code, creative writing, and common-sense QA workloads.
+`service.conf` has one section for hgn and one for GGUF; only the one in use is read at startup. An
+environment variable of the same name takes precedence over the file.
 
-Converting your own fine-tuned model (HF safetensors, same architecture):
+hgn v2:
 
 ```bash
-# without an imatrix
-python3 tools/flashnext2hgn.py /path/to/hf-model --out ./models
-# with an imatrix (llama.cpp format: GGUF or legacy imatrix.dat)
-python3 tools/flashnext2hgn.py /path/to/hf-model --out ./models --imatrix /path/to/imatrix.gguf
+MODEL_FILE="${MODEL_FILE:-$MODEL_DIR/qwen38-flash-next-v2.hgn}"
+NGRAM_FILE="${NGRAM_FILE:-$MODEL_DIR/qwen38-flash-next-ngram.hgn}"
+OVERLAY_FILE="${OVERLAY_FILE-}"
 ```
 
-It writes the base `.hgn`, the 8-bit dense overlay, the 8-bit MTP draft, the
-vision tower, the tokenizer and a ready-to-run `start.sh`; ~1.5 hours on 32
-cores, ~125 GiB of disk, needs only numpy. `--classic` is the old data-free
-converter (byte-identical output to before). High-quality conversion: see
-[HGN-HQ.md](docs/HGN-HQ.md); format and the old converter: see
-[CONVERT_EN.md](docs/CONVERT_EN.md).
+For GGUF use the actual subdirectories from the download; `GGUF_FILE` is the first shard:
 
-## YaRN and Shared KV Pool Configuration
+```bash
+# Linux: UD-Q4_K_XL
+GGUF_FILE="${GGUF_FILE:-$MODEL_DIR/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}"
+GGUF_MTP_FILE="${GGUF_MTP_FILE-$MODEL_DIR/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}"
+GGUF_VISION_FILE="${GGUF_VISION_FILE-$MODEL_DIR/mmproj-BF16.gguf}"
+# Windows: UD-IQ4_XS
+GGUF_FILE="${GGUF_FILE:-$MODEL_DIR/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf}"
+GGUF_MTP_FILE="${GGUF_MTP_FILE-$MODEL_DIR/mtp-Qwen3.8-Flash-Next-Q8_0.gguf}"
+GGUF_VISION_FILE="${GGUF_VISION_FILE-$MODEL_DIR/qwen38-flash-next-vision.hgn}"
+```
 
-**Keep three independent concepts separate: the per-request context limit,
-the service-wide KV pool capacity, and RoPE scaling.** Here K means 1024 tokens:
-256K = 262144 and 512K = 524288. Context includes input and generated output,
-including templates, conversation history, and image tokens, not just the
-latest user message.
+An empty `GGUF_MTP_FILE` disables speculation. On Windows you can also fill these in on the console's
+`#/engine` page instead of editing the file; saving writes back to the same `service.conf`. Loading and
+conversion rules are in [GGUF.md](docs/GGUF.md).
 
-### Native versus YaRN
+### Linux
 
-| | Native RoPE | YaRN factor 2 |
+Requirements: ROCm (HIP 7.x or newer), a gfx1151 GPU, ≥ 100 GiB available memory. Build dependencies:
+rocBLAS, hipBLASLt, rocPRIM; the API front end also needs libpng, libjpeg, libwebp.
+
+```bash
+bash build.sh        # builds engine, API front end, benchmark into build/
+bash start_hgn.sh    # start with hgn weights
+bash start_gguf.sh   # or with GGUF weights
+```
+
+The two launchers differ only in which weights they read: they load the engine, then start the API once it is
+ready. They run in the foreground and Ctrl+C stops both; over SSH, run them inside tmux. If anything is
+missing they list every missing file and exit; `--check` checks the configuration without starting. Logs are
+in `logs/<date-time>-<PID>/`. See [QUICKSTART_EN.md](docs/QUICKSTART_EN.md); build troubleshooting is in
+[BUILD_EN.md](docs/BUILD_EN.md).
+
+### Windows
+
+Same features as Linux (engine, OpenAI API, multimodal, concurrency). Requirements:
+
+- 96 GiB of GPU memory set in the BIOS. VRAM decides how much context you can open; see "Windows VRAM limit".
+- Running needs only the AMD graphics driver, no ROCm install.
+- Building needs Git for Windows (for Git Bash) and the TheRock Windows package (default
+  `C:\therock-dist-windows-gfx1151-10.1.0`, or point `THEROCK=` elsewhere); see [BUILD_EN.md](docs/BUILD_EN.md).
+
+Build in Git Bash (or double-click `build_win.bat`):
+
+```bash
+bash build_win.sh    # engine, benchmark, API tray app, and the root launcher start_win.exe
+```
+
+For daily use, double-click `start_win.exe` in the project root. It puts an icon in the system tray, opens no
+console window and does not load the model by itself. Double-click the tray icon to open the web console; on
+the `#/engine` page choose the weights (hgn or GGUF), edit the configuration and start the engine. The
+right-click menu can also start/stop the engine, copy the API address and open logs. Logs are in `logs\`. If
+you prefer the command line, `bash start_win.sh` in Git Bash behaves like the Linux launchers.
+
+Copying the built `build/` and `start_win.exe` together with `models/` to another gfx1151 Windows machine is
+enough to run there; that machine needs neither Git nor TheRock. Porting details are in
+[PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md).
+
+## Common Settings
+
+All settings are in `service.conf` (on Windows also editable on the console's `#/engine` page); an
+environment variable of the same name takes precedence. Restart the engine after editing.
+
+| Setting | Default | Meaning |
 | --- | --- | --- |
-| Purpose | The model's native 256K range; default mode | Inference configuration extending a sequence to 512K |
-| Position encoding | `ROPE_FACTOR=1` preserves native frequencies and default amplitude | Adjusts RoPE frequencies and applies amplitude scaling to main-attention Q/K |
-| Per-request limit | Set `MAX_CONTEXT=262144` | Set `MAX_CONTEXT=524288` |
-| Short prompts | Default baseline | Static YaRN applies to short prompts too and can change the output distribution |
-| KV storage | Determined by KV format and pool size | No KV compression or automatic pool expansion |
+| `MAX_CONTEXT` | `262144` | Input + output limit for a single request |
+| `KV_POOL_TOKENS` | `0` | Total KV shared by all concurrent requests; 0 means equal to `MAX_CONTEXT`; each extra 256K costs ~9.6 GiB |
+| `PARALLEL` | `4` | Number of requests running at once, 1–8 |
+| `PREFILL_CHUNK` | `0` | Tokens per prefill segment for long prompts; 0 means 16384 on Linux, 6144 on Windows |
+| `ROPE_FACTOR` | `1` | 1 is native 256K; set 2 and `MAX_CONTEXT=524288` for YaRN 512K |
+| `MTP_GAMMA` | `0` | Draft length; 0 is automatic, 1–8 fixes it |
 
-The factor is a position-encoding extension ratio, not a concurrency count,
-KV compression ratio, or automatic capacity allocation. Changing `MAX_CONTEXT`
-alone does not enable YaRN; changing `ROPE_FACTOR` alone does not change the
-context limit. For more native short/medium-context sessions, enlarge the pool
-without enabling YaRN.
+YaRN applies to the whole instance and slightly changes the output distribution even on short text (KLD
+0.023 vs native), so turn it on only when a single request really needs more than 256K. The 512K setup,
+shared-pool admission rules and validation scope are in [YARN-512K.md](docs/YARN-512K.md).
 
-The per-request limit must stay within the position-encoding range: with YaRN
-enabled, `MAX_CONTEXT` may not exceed `ROPE_FACTOR × ROPE_ORIGINAL_CTX` —
-the launchers and the engine refuse to start otherwise. With `ROPE_FACTOR=1`,
-exceeding the native 256K only warns (positions beyond it are unvalidated).
-For more concurrent KV capacity, enlarge `KV_POOL_TOKENS` instead of
-stretching `MAX_CONTEXT`.
+## Concurrency
 
-RoPE settings are **instance-wide**. Factor 2 applies to every request, not
-only after token 262144; one instance cannot serve one request with native
-RoPE and another with YaRN. Each sequence still has independent positions:
-two 200K requests are not concatenated into one 400K sequence. Keep native
-mode for primarily short-context traffic. To offer both modes, use separate
-instances after checking memory/ports, or stop and restart with another config.
+Several requests can run at the same time; a new one does not wait for the previous one to finish.
 
-### service.conf parameters
+- **One shared KV page pool.** `PARALLEL` slots (1–8, default 4) take 256-token pages from one pool on
+  demand, like llama.cpp's shared context. The pool defaults to 256K in total: four 64K requests, or one
+  200K plus a few short ones. `MAX_CONTEXT` limits a single request; the total across all concurrent
+  requests is the pool size `KV_POOL_TOKENS`.
+- **Batched decode.** The MTP verify steps of all active requests are merged into one batch and computed in
+  the same step, so more requests share each round's weight reads. The draft length γ is chosen
+  automatically from the number of active requests.
+- **Long prompts don't block others.** Prefill yields the GPU between layers about every 300 ms, giving
+  each decoding session a round; other sessions stall at most ~0.6 s. When several long prompts arrive
+  together, the one with less remaining work finishes first.
+- **When the pool runs out:** in-memory checkpoints are evicted first, then idle slots' KV; if that is still
+  not enough, the later request is aborted (the API returns an error). An earlier request is never pushed
+  out by a later one. Requests beyond `PARALLEL` queue for a slot.
+- **Reproducible.** With v2 weights, greedy requests and sampled requests with a `seed` produce exactly the
+  same output under concurrency as when run alone. On GGUF, near-tie tokens occasionally differ; set
+  `QWENOX_OCC_FORCE=4` for strict equality at a small throughput cost.
 
-Edit the existing lines rather than appending duplicates. With the
-`${VARIABLE:-default}` syntax, same-name environment variables take precedence.
-Restart both engine and API after changing the file.
+API concurrent throughput (Windows, coding prompts, greedy, MTP on, 2 × 1200 tokens per request, total tok/s
+across all requests):
 
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `MAX_CONTEXT` | `262144` | Per-request input + output limit, not the sum of concurrent requests; must not exceed `ROPE_FACTOR × ROPE_ORIGINAL_CTX` (startup is refused otherwise; factor 1 above the native length only warns) |
-| `ROPE_FACTOR` | `1` | Native at 1; use 2 for 512K and change MAX_CONTEXT separately |
-| `ROPE_ORIGINAL_CTX` | `262144` | Native model length; keep this value with YaRN, do not set it to 524288 |
-| `ROPE_BETA_FAST` / `ROPE_BETA_SLOW` | `32` / `1` | Frequency mixing boundaries; normally unchanged; engine requires beta_fast >= beta_slow > 0 |
-| `ROPE_ATTN_SCALE` | `0` | Automatic amplitude: 1 for native, `1 + 0.1 * ln(factor)` for YaRN (about 1.0693 at factor 2); a positive value overrides it |
-| `KV_PAGED` | `1` | Paged shared pool; required for PARALLEL > 1 with a pagination-compatible kernel combination |
-| `KV_POOL_TOKENS` | `0` | Physical pool shared by all slots, in tokens; 0 follows MAX_CONTEXT, smaller values are clamped to MAX_CONTEXT, rounded up to 256-token pages |
-| `PARALLEL` | `4` | Concurrent slots, range 1–8; neither multiplies the pool nor divides the per-request limit |
-| `QWENOX_KV_RESERVE_DECODE` | `4096` | Engine environment variable limiting decode tokens reserved at admission, not generated output; valid range 0–2147483647 |
+| Concurrent requests | 1 | 4 | 8 |
+| --- | --- | --- | --- |
+| hgn v2 | 55.3 | 83.2 | 97.0 |
+| GGUF UD-IQ4_XS | 47.0 | 70.7 | 82.4 |
 
-Script launchers export `ROPE_*` as the corresponding `QWENOX_ROPE_*` variables for
-both engine and API. Direct engine invocation also supports `--rope-factor`,
-`--rope-original-ctx`, `--rope-beta-fast`, `--rope-beta-slow`, and `--rope-attn-scale`;
-the API uses `QWENOX_ROPE_*` environment variables. Keep both sides consistent:
-changing only the API's health metadata does not alter engine RoPE.
+Total throughput rises with the number of requests, but each request gets less: about 12 tok/s per request
+at 8. Configuration, scheduling and verification are in [CONCURRENCY.md](docs/CONCURRENCY.md).
 
-### Two different 512K configurations
+## Windows VRAM limit
 
-`MAX_CONTEXT` expresses only the per-request limit; concurrent capacity is
-always expressed with `KV_POOL_TOKENS`. Configurations where `MAX_CONTEXT`
-exceeds `ROPE_FACTOR × ROPE_ORIGINAL_CTX` are refused at startup.
+On Windows, VRAM decides how much context you can open. A process can only reliably use one block of device
+memory allocated at startup, capped at about 95 GiB; weights, the KV page pool, the prefill workspace and the
+vision tower all have to fit in it. Anything that does not fit at run time falls back to shared (host) memory,
+with no guarantee of speed or stability. Actual use of that block (measured 2026-10-13, tray production config:
+MTP on, vision tower on, prefill chunk 8192):
 
-| Mode | MAX_CONTEXT | KV_POOL_TOKENS | ROPE_FACTOR | Example PARALLEL |
+| Configuration | hgn v2 | UD-IQ4_XS + MTP | UD-IQ4_XS without MTP | hgn w4b |
 | --- | --- | --- | --- | --- |
-| Default native 256K pool | `262144` | `0` | `1` | `4` |
-| Native 256K per request, 512K total pool | `262144` | `524288` | `1` | `2` |
-| YaRN 512K per request, 512K pool, single slot | `524288` | `0` or `524288` | `2` | `1` |
-| YaRN 512K per request, 512K pool, multiple slots | `524288` | `0` or `524288` | `2` | `2` |
+| 256K pool, 4 slots | 82.6 GiB | 83.9 GiB | 79.4 GiB | 88.8 GiB |
+| 512K pool (256K per request), 2 slots | 92.2 GiB | 93.5 GiB | — | does not fit (6 GiB over) |
+| 512K pool (256K per request), 8 slots | 93.8 GiB | just over (~70 MiB) | — | — |
+| YaRN 512K (512K per request), 2 slots | 93.3 GiB | 94.5 GiB | — | — |
 
-**Mode A: native RoPE, only a larger pool.** Two sequences dynamically share
-512K; each remains limited to 256K. This does not grant one request a 512K
-context. Replace the corresponding service.conf lines:
-
-```bash
-MAX_CONTEXT="${MAX_CONTEXT:-262144}"
-KV_POOL_TOKENS="${KV_POOL_TOKENS:-524288}"
-ROPE_FACTOR="${ROPE_FACTOR:-1}"
-KV_PAGED="${KV_PAGED:-1}"
-PARALLEL="${PARALLEL:-2}"
-```
-
-**Mode B: YaRN extends a sequence to 512K.** The total pool is still 512K.
-This example enables two shared slots; set `PARALLEL` to 1 for single-slot
-long-context operation. Replace the corresponding lines:
-
-```bash
-MAX_CONTEXT="${MAX_CONTEXT:-524288}"
-KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
-ROPE_FACTOR="${ROPE_FACTOR:-2}"
-ROPE_ORIGINAL_CTX="${ROPE_ORIGINAL_CTX:-262144}"
-ROPE_BETA_FAST="${ROPE_BETA_FAST:-32}"
-ROPE_BETA_SLOW="${ROPE_BETA_SLOW:-1}"
-ROPE_ATTN_SCALE="${ROPE_ATTN_SCALE:-0}"
-KV_PAGED="${KV_PAGED:-1}"
-PARALLEL="${PARALLEL:-2}"
-```
-
-For a temporary override without editing the file, check first and remove
-`--check` to start the service:
-
-```bash
-MAX_CONTEXT=524288 KV_POOL_TOKENS=0 KV_PAGED=1 PARALLEL=2 \
-ROPE_FACTOR=2 ROPE_ORIGINAL_CTX=262144 ROPE_BETA_FAST=32 \
-ROPE_BETA_SLOW=1 ROPE_ATTN_SCALE=0 bash start_hgn.sh --check
-```
-
-Linux GGUF uses the same variables with `start_gguf.sh`. Hardware acceptance
-used Linux hgn + BF16 paged KV + WMMA + BTV; not every weight/kernel/platform
-combination has been verified. Both Windows launchers, `start_win.sh` and the
-native `start_win.exe`, read the `service.conf` `ROPE_*` settings, apply the
-same validation, and forward them as `QWENOX_ROPE_*` to engine and API; however,
-Windows 512K hardware acceptance remains pending, and the 512K pool must
-separately fit the Windows arena (95 GiB limit) and device memory.
-
-### Two typical scenarios (reference)
-
-**Scenario 1: no YaRN, two concurrent slots each up to the native 256K.**
-This is mode A above: `MAX_CONTEXT=262144` + `KV_POOL_TOKENS=524288` +
-`PARALLEL=2` + `ROPE_FACTOR=1`. The intuitive "set 512K so two concurrent
-requests get 256K each" is expressed by keeping the per-request limit at the
-native 256K and giving 512K to the shared pool. The two sequences share 512K
-dynamically; a single request beyond 256K is still rejected.
-
-**Scenario 2: YaRN on, two concurrent slots sharing a 512K pool.** This is
-mode B above: `MAX_CONTEXT=524288` + `ROPE_FACTOR=2` + `KV_POOL_TOKENS=0` +
-`PARALLEL=2`. When two requests together exceed 512K, the later one is
-rejected at admission (the API returns an error, engine logs "rejected at
-admission") while the earlier one is unaffected. Set `PARALLEL=1` if 512K
-requests should never contend.
-
-### How concurrency occupies the pool
-
-`PARALLEL` specifies the maximum number of active slots. The pool is
-preallocated at startup and never automatically multiplied by concurrency;
-slots do not receive fixed `pool/PARALLEL` partitions. One sequence can use up
-to its own context limit and others use the remaining pages. Requests queue
-when all slots are busy. With an idle slot but insufficient KV budget,
-multi-slot admission rejects the later request. GPU work interleaves at safe
-scheduling boundaries; twice as many slots does not imply twice the throughput
-and can increase request latency.
-
-For `MAX_CONTEXT=524288, KV_POOL_TOKENS=0, PARALLEL=2, ROPE_FACTOR=2`:
-
-| Requests | Behavior |
-| --- | --- |
-| One sequence close to 512K input + output; other slot idle | Can use the full pool; two slots do not halve its context limit |
-| Two prompts around 200K each | Both can be admitted if their decode reservations also fit |
-| Two prompts around 300K each | Exceed the shared 512K budget; the later request is rejected at the next safe scheduling boundary, not after a full prefill |
-| Initially fit, then decode grows beyond its reservation | Can still exhaust the pool and trigger eviction/abort; admission does not guarantee unlimited generation |
-
-Admission uses 256-token pages and conservative active-sequence accounting:
-
-```text
-target_pages = ceil(min(MAX_CONTEXT,
-                        prompt_tokens + min(max_tokens, QWENOX_KV_RESERVE_DECODE)) / 256)
-other_active_slot_budget = max(target_pages, actual_mapped_pages)
-available_budget = pool_pages - sum(other_active_slot_budgets)
-request_need = target_pages; for live continuation, max(target_pages, mapped_pages)
-```
-
-- Non-prefix reuse resets the old slot. Released old pages are not counted
-  again as the new request's growth baseline.
-- Cache hits reduce prefill work, not the storage occupied by existing KV.
-  Active sequences are charged independently even when they physically share
-  a prefix; admission does not depend on those savings to allow oversubscription.
-- Idle slots and RAM-checkpoint pins occupy physical pages; COW may need
-  another page. Admission treats reclaimable pages as evictable rather than
-  permanently subtracting every cache, and allocation retains pressure handling.
-- On exhaustion, evict RAM checkpoints, then idle-slot KV; if still necessary,
-  abort a later-admitted active request. A request needing pages can itself fail
-  when it is the later one. Aborted generation returns an API error.
-- `QWENOX_KV_RESERVE_DECODE=4096` does not truncate output at 4096. Request budget
-  and `MAX_CONTEXT` still limit generation. Smaller reservations can admit more
-  requests but increase mid-generation starvation risk.
-- `PARALLEL=1` bypasses multi-slot admission, not context/pool limits or cache
-  eviction.
-
-To hold two complete 512K sequences concurrently, set `KV_POOL_TOKENS` to at
-least `1048576` and reassess memory, checkpoints and COW. This is neither the
-default pool nor part of the reported hardware acceptance. A larger pool
-mainly increases KV storage; more slots add per-sequence state such as GDN.
-Equal pool sizes do not imply identical total memory with different
-`MAX_CONTEXT`/`PARALLEL` settings.
-
-### Startup checks, caching and validation scope
-
-- Use BF16 KV + WMMA + BTV for 512K; the Linux launchers already set this
-  combination. Above native 256K, the engine disables `QWENOX_QSA_UNION`;
-  do not force unverified kernel combinations.
-- Inspect `--check` for the per-sequence limit, shared pool and slot count.
-  After startup, verify engine logs for `RoPE: YaRN factor=2`, `[kvpage]` page
-  count and KV format; `/health` should show `context=524288` and
-  `rope_scaling.factor=2`. Native mode reports `rope_scaling=null`. The API takes
-  its context from engine INFO, not just its command-line argument.
-- The Linux hgn 512K test used about 108 GiB of gpu-accessible committed
-  memory. KV array size is not the whole-machine budget; do not add UMA RSS
-  and device measurements as independent allocations. Check weights, KV/BTV,
-  workspaces and OS headroom before enlarging the pool.
-- RoPE parameters are included in the SSD KV fingerprint. Restart to switch
-  modes/parameters; incompatible snapshots will not be reused. Deleting them
-  is unnecessary for correctness, but old files can occupy disk quota until
-  LRU eviction.
-- The 2026-09-30 Linux/gfx1151 results cover 500K prefill/needles, exact 512K
-  boundaries, factor-2 two-slot concurrency, reset/COW/SSD restore, decode
-  beyond reservations, and cancellation. At 256K, native prefill measured
-  1589.4 versus 1582.1 tok/s with YaRN (re-measured 2026-10-07, about 0.5%
-  difference), not a promise of zero overhead for every workload. A short
-  probe had factor-2 versus
-  native mean KLD 0.0234 and same-top 93.5%; outputs need not be identical.
-  See [YARN-512K.md](docs/YARN-512K.md) for implementation/limits and
-  [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) for the hardware report.
-
-## Windows
-
-The Windows version has feature parity with the Linux version (engine +
-OpenAI API + multimodal). Porting notes and measurements are in
-[PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md). Builds run in Git Bash
-(or double-click `build_win.bat`; Git is only needed at build time):
-
-```bash
-bash build_win.sh           # All required artifacts: engine, benchmark, API, root stub
-bash build_win.sh api       # OpenAI API frontend (a tray app on Windows)
-bash build_win.sh launcher  # Minimal root stub start_win.exe
-```
-
-For daily use, double-click `start_win.exe` (native Win32, no
-Git/PowerShell needed): it launches `build\qwenox-win.exe` with the repo
-root as working directory — on Windows the API component itself is the tray
-app, with no console window: it only puts a tray icon in the notification
-area (right-click: open console / start·stop engine / copy API URL / view
-logs / quit; double-click: open the web console). The engine does **not**
-start automatically: edit settings on the console's `#/engine` page (written
-back to `service.conf`, shared with Linux) and start/stop the engine there,
-or use the tray right-click menu. The API's own output goes to
-`logs\api-win-*.log`, engine output to `logs\engine-api-*.log`; for
-troubleshooting, `build\qwenox-win.exe --console` restores console mode.
-The tokenizer loads from `TOKENIZER_DIR` (default `models/tokenizer`) and
-falls back to the repo-bundled `data/tokenizer` (see its README). The old
-setup-panel launcher is archived in `attic/launcher/` and no longer
-maintained. Clients connect to `http://<host>:8731/v1`.
-
-Distribution: copy `build/` + `start_win.exe` + `models/` to any gfx1151
-Windows machine and it just works — **no ROCm/TheRock installation
-needed**; only the AMD GPU driver, plus enough VRAM carved out for the GPU
-in BIOS (a 256K context needs 96 GiB).
-
-Differences from the Linux version:
-
-- Only hgn weights are supported: usable VRAM on Windows is capped at
-  about 96 GiB, and GGUF weights are larger (hgn saves ~11 GiB over GGUF)
-  and do not fit — `start_gguf.sh` does not apply; hgn weights are
-  produced by the conversion tool, see [CONVERT_EN.md](docs/CONVERT_EN.md).
-  The high-quality hgn works by swapping files: weight arena +2.2 GiB,
-  estimated ~93.2 GiB at 256K / chunk 8192 (limit 95); not yet measured
-  on Windows
-- Image decoding supports PNG/JPEG via stb_image (WebP not wired up)
-- Prefill chunk defaults to 8192
-- Cold loading reads the full weights from disk (minute-scale, progress
-  shown in console/logs)
-- The launchers do not enable `QWENOX_GEMM_WMMA` or `QWENOX_GDN_FUSED` (the
-  self-written WMMA GEMM and fused GDN kernel already promoted on Linux
-  launchers, worth ~8-10% PP combined but unverified under TheRock — so
-  Windows prefill uses hipBLASLt plus the legacy GDN path)
-
-Known issues (root causes unknown; there are quite a few quirks, fixes
-pending, priority very low):
-
-- VRAM allocations above 41 GiB or 63 GiB fail
-- The model hangs during decode (suspected console output backpressure: once
-  the console is paused by a click/selection, child processes block on logging.
-  Fixed: the launcher is now a tray app whose logs bypass the console, and
-  kvsnap no longer prints while holding its lock; pending verification)
-
-Build details are in [BUILD_EN.md](docs/BUILD_EN.md).
+- **v2 goes up to 512K**: either two 256K requests resident at once (`KV_POOL_TOKENS=524288`), or one 512K request
+  with YaRN (`MAX_CONTEXT=524288`, `ROPE_FACTOR=2`). 8 slots also fit, but with only ~1 GiB to spare; image-heavy
+  multimodal requests allocate more at run time, so 2–4 slots are recommended at 512K.
+- **UD-IQ4_XS with MTP uses ~1.3 GiB more than v2**; at a 512K pool use at most 2–4 slots.
+- **w4b is limited to 256K.**
+- The table was measured at prefill chunk 8192; the default 6144 uses about 1.7 GiB less in every row, with PP
+  within ~0.5% of 8192. 16384 does not fit.
+- The launcher refuses pools above 512K.
+- UD-Q4_K_XL is 77 GiB resident; extrapolating from the table, 256K alone would need ~97 GiB, so it is not
+  supported on Windows.
+- Task Manager's "Dedicated GPU memory" shows the whole block reserved at startup: the use above plus up to 4 GiB
+  of headroom (capped at 95 GiB), plus ~1.3 GiB, i.e. ~88.6 GiB for v2 at 256K and ~95.7 GiB for any 512K
+  configuration. The engine also uses 3–4 GiB of host memory.
 
 ## Documentation
 
-- [QUICKSTART_EN.md](docs/QUICKSTART_EN.md) — build, launch, configuration
-- [BUILD_EN.md](docs/BUILD_EN.md) — build environment details and
-  troubleshooting
-- [GGUF.md](docs/GGUF.md) (Chinese) — GGUF weight loading, performance vs hgn
-- [HGN-HQ.md](docs/HGN-HQ.md) (Chinese) — high-quality hgn: one-step conversion
-  (optional imatrix), results, deployment
+- [QUICKSTART_EN.md](docs/QUICKSTART_EN.md) — build, start, configure
+- [BUILD_EN.md](docs/BUILD_EN.md) — build environment and troubleshooting
+- [GGUF.md](docs/GGUF.md) — how GGUF weights are loaded, with measurements
 - [CONVERT_EN.md](docs/CONVERT_EN.md) — model conversion tool
-- [KLD.md](docs/KLD.md) (Chinese) — quality testing (KLD, same method as
-  unsloth / llama.cpp)
-- [MTP_EN.md](docs/MTP_EN.md) — speculative decoding parameters and comparison
-  methods
-- [NGRAM_EN.md](docs/NGRAM_EN.md) — ngram verification design, benefits, and
-  known divergences
-- [CONCURRENCY.md](docs/CONCURRENCY.md) — concurrent requests (PARALLEL)
-  configuration and semantics (Chinese)
-- [YARN-512K.md](docs/YARN-512K.md) — YaRN 512K implementation, pool admission and validation scope
-- [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) (Chinese) — Linux/gfx1151 long-context and concurrency results
-- [HGN-FORMAT_EN.md](docs/HGN-FORMAT_EN.md) — the `.hgn` weight container
-  format
-- [GGUF.md](docs/GGUF.md) — running directly from llama.cpp GGUF weights
-  (Chinese)
-- [data/README_EN.md](data/README_EN.md) — numerical regression benchmark
-  (data/qsa-oracle) description
-- [PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md) — Windows porting notes
-  and measurements
+- [HGN-FORMAT_EN.md](docs/HGN-FORMAT_EN.md) — the `.hgn` weight container format
+- [CONCURRENCY.md](docs/CONCURRENCY.md) — concurrent requests: configuration, scheduling, verification
+- [YARN-512K.md](docs/YARN-512K.md) / [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) — YaRN 512K and measurements
+- [MTP_EN.md](docs/MTP_EN.md) / [NGRAM_EN.md](docs/NGRAM_EN.md) — speculative decoding
+- [KLD.md](docs/KLD.md) — quality testing (same method as unsloth / llama.cpp)
+- [BENCHMARK_EN.md](docs/BENCHMARK_EN.md) — benchmark tools
+- [PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md) — Windows port and measurements
 
-## Tests
-
-```bash
-bash build.sh test     # Kernel unit tests, no model loading, expect ALL PASS
-python3 tools/bpw.py   # bpw of the weights under models/ by category (headers only)
-```
-
-Quality (KLD) testing needs a BF16 reference; see [KLD.md](docs/KLD.md).
+Tests: `bash build.sh test` runs the kernel unit tests (no model loaded, expect ALL PASS);
+`python3 tools/bpw.py` reports the bpw of each weight file under `models/`.
 
 ## Acknowledgements
 
-This project's implementation borrows from [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server) by peonist-ai. The `.hgn` weight container format is halogen's checkpoint container format — see [HGN-FORMAT_EN.md](docs/HGN-FORMAT_EN.md). Many thanks to the halogen authors.
+The implementation approach draws on peonist-ai's [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server); the `.hgn` weight container format is halogen's checkpoint container format (see [HGN-FORMAT_EN.md](docs/HGN-FORMAT_EN.md)). Thanks to the halogen authors for their work.
 
-GGUF support heavily references [gufo](https://github.com/gufo-org/gufo) (MIT license): the routed-expert F16 WMMA GEMM kernel is ported from its RoutedF16GEMMKernel (`src/gpu/parts/26_kernels_moe_gguf.inc`); the LUT-decoded variants for hgn q4cp / GGUF IQ4 follow the same pipeline (`27_kernels_moe_lut.inc`); the GGUF↔engine tensor transform semantics reference its reference.cpp (`src/gguf_map.h`). Prefill optimizations such as HC gate fusion and producer epilogues writing the next GEMM's input directly also borrow from gufo's approach (comparison analysis in [GUFO-GAP.md](docs/GUFO-GAP.md), Chinese).
+GGUF support draws heavily on [gufo](https://github.com/gufo-org/gufo) (MIT license): the routed-expert F16 WMMA GEMM kernel is ported from its RoutedF16GEMMKernel (`src/gpu/parts/26_kernels_moe_gguf.inc`), the LUT-decode variant for hgn q4cp / GGUF IQ4 follows the same pipeline (`27_kernels_moe_lut.inc`), and the GGUF-to-engine tensor transform semantics follow its reference.cpp (`src/gguf_map.h`). Prefill optimizations such as HC gate fusion, producer epilogues writing the next GEMM's input directly, and the multi-row Q8 dense kernel also follow gufo's approach (comparison in [GUFO-GAP.md](docs/GUFO-GAP.md)).
 
-The ngram speculative drafting approach and the two-tier prompt cache borrow ideas from the open-source [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT license); GGUF weights and the vision tower (mmproj) reuse the very same files as llama.cpp. See the "Attribution" section of [NGRAM_EN.md](docs/NGRAM_EN.md).
+The ngram speculative drafting idea and the two-level prompt cache draw on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT license); GGUF weights and the vision tower (mmproj) reuse the same files as llama.cpp, and the IQ3_S grid table comes from llama.cpp. See the "Attribution" section of [NGRAM_EN.md](docs/NGRAM_EN.md) for the ngram notice.
 
 ## License
 

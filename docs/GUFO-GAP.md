@@ -1,4 +1,4 @@
-# gfx1151-engine vs gufo：prefill 差距分析（2026-09-25）
+# Qwenox vs gufo：prefill 差距分析（2026-09-25）
 
 gufo：`gufo-main/src/models/qwen38_flash_next`，同一模型，权重为 Unsloth UD-Q4_K_XL GGUF，
 prefill chunk 固定 2048，单 stream，prefill 不用 hipGraph。

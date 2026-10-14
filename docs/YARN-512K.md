@@ -77,7 +77,10 @@ bash start_hgn.sh --check
 ```
 
 Remove `--check` after the configuration check passes. The Windows launcher
-uses the same environment variables.
+uses the same environment variables. On Windows the whole configuration must fit the
+95 GiB device arena: with v2 weights, YaRN 512K with 2 slots uses 93.3 GiB and a
+native 512K pool with 2–8 slots 92.2–93.8 GiB (measured 2026-10-13, startup
+footprint plus one 8K request; 512K was not filled). w4b does not fit 512K.
 
 The default `ROPE_FACTOR=1` preserves native RoPE. Do not enable YaRN
 statically for short-context service traffic.

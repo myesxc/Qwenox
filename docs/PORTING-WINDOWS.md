@@ -7,6 +7,26 @@
 > 的**实测数据**。探针源码在 `tools/winprobe/`，可复跑。
 > **第三版：移植已完成并验证通过**，见下节。
 
+## 显存容量（2026-10-13 实测，现行）
+
+进程启动时一次性申请一整块显存（arena，上限 95 GiB），之后所有设备内存都在里面子分配；放不下的部分
+回退 `hipMalloc`，按下文"显存分配"的规则会落到共享内存。生产配置（托盘程序同款环境变量，MTP 开、
+视觉塔开、prefill chunk 8192）下 arena 的实际用量（`QWENOX_ARENA_DEBUG=1` 的最大偏移）：
+
+| 配置 | v2 hgn | UD-IQ4_XS + MTP | UD-IQ4_XS 无 MTP | w4b |
+|---|---|---|---|---|
+| 256K 页池，4 路 | 82.6 GiB | 83.9 GiB | 79.4 GiB | 88.8 GiB |
+| 512K 页池（单条 256K），2 路 | 92.2 GiB | 93.5 GiB | — | 估算 98.8，6 GiB 回退 |
+| 512K 页池（单条 256K），8 路 | 93.8 GiB | 估算 95.8，66 MiB 回退 | — | — |
+| YaRN 512K（单条 512K），2 路 | 93.3 GiB | 94.5 GiB | — | — |
+
+- 页池每多 256K 约 +9.6 GiB，每多一路约 +0.27 GiB。v2 带不带 `mtp.hgn` 用量相同（主体自带草稿头）。
+- arena 预留 = 估算 + 4 GiB 余量，封顶 95 GiB；512K 配置下余量只剩 1–3 GiB，运行期的额外分配（图片多的
+  多模态请求等）要从这里出。任务管理器"专用 GPU 内存"显示的是预留块再加约 1.3 GiB。
+- 冷启动（权重读进 arena）：v2 约 35 s，UD-IQ4_XS 约 50–60 s，w4b 约 35 s。
+- 以上只测了启动占用和一条 8K 请求，没有把 512K 实际填满。复跑：`bash tools/vram_footprint_win.sh`（每个配置约
+  1–2 分钟，需先停掉生产服务；`CASES=` 选配置，汇总在 `logs/vram_footprint.txt`）。
+
 ## 移植结果（2026-09-19 收尾，全部实测）
 
 **移植完成，引擎与 OpenAI 兼容 API 在 Windows + gfx1151 上全功能运行。**
@@ -35,7 +55,7 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
 > pp8K @ chunk 2048 816 → 1215 tok/s、pp32K @ chunk 16384 1237 → 1422，KLD 不变、decode 不变
 > （详见 [GGUF.md](GGUF.md) "hgn 路由专家也走 WMMA"）。开启后 `GDEC_MOE_LT=1` 不再生效，
 > 它的 dequant/gather 缓冲（chunk 8192 约 0.4 GiB，16384 约 0.8 GiB）不再分配，arena 估算同步变小。
-> 因此 Windows 继续用 hgn（显存比 GGUF 少约 11 GiB），不需要换 GGUF。
+> 因此 Windows 继续用 hgn（显存比 UD-Q4_K_XL 少约 11 GiB），不需要换 GGUF。
 >
 > **Windows 实测（2026-09-26，heretic.hgn，env 与 start_win.sh 生产配置一致）**：kernel 生效但
 > 收益明显小于 Linux。32K @ chunk 16384（maxctx 40960）A/B：暖 chunk 1068.3 tok/s vs
@@ -46,6 +66,12 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
 > 全程平均 **~1000 tok/s**，无衰减断崖；逐 chunk 缓降来自 PLE 按需读随前缀变长
 > （prof 的 ple_wait 逐 chunk 增长），属预期。
 
+> **2026-10-13 更新（GGUF 可在 Windows 启动）**：纯 GGUF 启动已移植到 Windows，目标文件是 Unsloth
+> `UD-IQ4_XS`（专家 IQ3_S/IQ4_XS/IQ4_NL/Q8_0，主干常驻 60.4 GiB；加上 Q8_0 MTP sidecar 后 arena 用量反而比
+> v2 hgn 多约 1.3 GiB，只有不用 MTP 时才比 v2 省 3.2 GiB）。专家与 dense
+> 拷进 devarena，PLE 表在分片里按需读盘。设置页选"GGUF"即可，详见 [GGUF.md](GGUF.md)"UD-IQ4_XS（Windows）"；
+> 一键验证 `bash tools/iq4xs_verify_win.sh`。
+>
 > **2026-09-26 更新（高质量 hgn）**：新的 8-bit dense overlay + imatrix 路由专家基座（同一 hgn 格式，
 > 见 [HGN-HQ.md](HGN-HQ.md)）把 KLD 从 0.163 降到 GGUF 量级；weight arena +2.2 GiB，
 > 256K / chunk 8192 估算 ~93.2 GiB（上限 95）。只需换文件（`MODEL_FILE` / `OVERLAY_FILE`），Windows 上尚未实测。
@@ -57,7 +83,8 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
   装进进程第一笔分配。`devarena_estimate` 镜像 GpuModel 全部分配公式，
   预留 = 估算 + slack（`GDEC_ARENA_SLACK_GB`，默认 4 GiB），封顶
   `GDEC_ARENA_CAP_GB`（默认 **95.0**，对应 96 GiB BIOS 划分的实测上限）。
-  Windows 默认 prefill chunk 8192（`eff_maxbatch`；Linux 32768）。
+  Windows 默认 prefill chunk 6144（`eff_maxbatch`；Linux 32768）：64K 稳态 PP 与 8192 差约 0.5%，
+  工作区少约 1.7 GiB，也不触发 P≥8192 才开的 B3 split-K（4096 慢约 5%）。
   **256K 下不要设 `GDEC_PREFILL_CHUNK=16384`**（会触发截断 + 溢出回退）；
   maxctx ≤ 40K 时 16384 放得下且 PP 快 ~6%（见验证矩阵实测）。
 - **新权重加载器**（`load_arena` Windows 分支）：CreateFile

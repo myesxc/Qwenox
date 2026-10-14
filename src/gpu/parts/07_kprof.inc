@@ -12,14 +12,35 @@ static bool g_kprof_on = [] {
   return e && !(e[0] == '0' && e[1] == 0);
 }();
 static bool g_kprof_mute = false;
+// QWENOX_KPROF_SYNC=1: synchronize the stream at every mark and time with the
+// host clock instead of GPU events (Windows event timestamps are quantized to
+// KMD submission batches, so per-segment attribution from events can be off
+// by whole segments). Serializes the pipeline: absolute totals grow by the
+// per-mark sync cost (~tens of us), but each segment's time is its own.
+static bool g_kprof_sync = [] {
+  const char* e = getenv("QWENOX_KPROF_SYNC");
+  return e && !(e[0] == '0' && e[1] == 0);
+}();
 
 struct KProfRing {
   static constexpr int CAP = 8192;
   hipEvent_t ev[CAP]{};
+  double hts[CAP]{};  // host ms at the mark (sync mode)
   const char* tag[CAP]{};
   uint8_t kind[CAP]{};  // 0 = 分段边界, 1 = 子区间开始, 2 = 子区间结束
   int n = 0;
   bool ready = false, overflow = false;
+  static double host_ms() {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+  float span(int a, int b) {  // ms between marks a and b
+    if (g_kprof_sync) return (float)(hts[b] - hts[a]);
+    float ms = 0;
+    CK(hipEventElapsedTime(&ms, ev[a], ev[b]));
+    return ms;
+  }
   void init() {
     if (ready) return;
     for (int i = 0; i < CAP; i++) CK(hipEventCreateWithFlags(&ev[i], 0));  // 要计时
@@ -37,19 +58,26 @@ struct KProfRing {
     }
     tag[n] = t;
     kind[n] = (uint8_t)k;
-    CK(hipEventRecord(ev[n], g_str));
+    if (g_kprof_sync) {
+      CK(hipStreamSynchronize(g_str));
+      hts[n] = host_ms();
+    } else {
+      CK(hipEventRecord(ev[n], g_str));
+    }
     n++;
   }
   // 每 chunk 一次（此刻主流已被 argmax D2H 排空；非 final chunk 则在此同步）。
-  // quiet（spec verify 的小 chunk）只重置不打印，避免 decode 阶段刷屏。
+  // quiet（spec verify 的小 chunk）只重置不打印，避免 decode 阶段刷屏；
+  // QWENOX_KPROF_V=1 时 quiet 也打印（S3b：verify 路径逐算子分解用）。
   void flush(int base, int P, bool quiet) {
     if (!ready || n == 0) return;
-    if (quiet) {
+    static const bool kpv = getenv("QWENOX_KPROF_V") != nullptr;
+    if (quiet && !kpv) {
       n = 0;
       overflow = false;
       return;
     }
-    CK(hipEventSynchronize(ev[n - 1]));
+    if (!g_kprof_sync) CK(hipEventSynchronize(ev[n - 1]));
     std::vector<std::pair<const char*, double>> seg;
     auto add = [&](const char* t, double ms) {
       for (auto& p : seg)
@@ -76,8 +104,7 @@ struct KProfRing {
     for (int i = 0; i < n; i++) {
       if (kind[i] == 0) {
         if (lastb >= 0) {
-          float ms = 0;
-          CK(hipEventElapsedTime(&ms, ev[lastb], ev[i]));
+          float ms = span(lastb, i);
           // Windows/TheRock: 个别 event 的时间戳会回跳 ~200 ms（疑似 KMD 提交
           // 批边界处的时钟域差异），每 chunk 约一次。负区间钳为 0 并计入
           // neg_clamp，总量与归属误差据此可估。
@@ -93,8 +120,7 @@ struct KProfRing {
         if (sub_top < 16) sub_stk[sub_top++] = i;
       } else if (sub_top > 0) {
         int b = sub_stk[--sub_top];
-        float ms = 0;
-        CK(hipEventElapsedTime(&ms, ev[b], ev[i]));
+        float ms = span(b, i);
         if (ms < 0) {
           neg_clamp += -ms;
           ms = 0;

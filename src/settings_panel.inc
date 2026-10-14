@@ -6,8 +6,8 @@
 //
 // 面板分 4 页，顶部 4 个 BS_PUSHLIKE|BS_AUTORADIOBUTTON 切换（不引入 comctl32）：
 //   第 1 页 权重：V1（w4b 单文件）/ V2（主体+独立 n-gram）/ GGUF 版本选择，
-//          各版本只显示自己相关的文件行；GGUF 仅保存（本机服务由 start_win.exe
-//          启动，只支持 hgn；GGUF 配置供 Linux bash start_gguf.sh 使用）。
+//          各版本只显示自己相关的文件行；GGUF 由 qwenox-win 按 weights=gguf 标记
+//          直接启动（GGUF_FILE 首分片 + GGUF_MTP_FILE + GGUF_VISION_FILE）。
 //   第 2 页 上下文与并发：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
 //          KV_PAGED / PREFILL_CHUNK / YaRN 勾选（ROPE_FACTOR 按上限自动推导）。
 //          ROPE_ORIGINAL_CTX 不做 UI 行（用户不该改）：校验仍从 g_conf/环境读，
@@ -233,6 +233,104 @@ unsigned long long hgn_tensor_bytes(const std::string& path, const char* name) {
     return bytes;
 }
 
+// GGUF：在一个分片文件里找张量 name，返回它的数据字节数（0 = 没找到/不认识的
+// 类型）。只读头部：KV 段逐项跳过（数组按元素类型跳），张量表按块大小算字节。
+// 块大小表与 src/gguf.h block_info 一致（只列本项目会遇到的类型）。
+unsigned long long gguf_tensor_bytes_in(const std::string& path, const char* name) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    unsigned long long out = 0;
+    auto rd = [&](void* p, size_t n) { return fread(p, 1, n, f) == n; };
+    auto skip = [&](unsigned long long n) { return _fseeki64(f, (long long)n, SEEK_CUR) == 0; };
+    auto scalar_size = [](uint32_t t) -> unsigned {
+        switch (t) {
+            case 0: case 1: case 7: return 1;
+            case 2: case 3: return 2;
+            case 4: case 5: case 6: return 4;
+            case 10: case 11: case 12: return 8;
+            default: return 0;
+        }
+    };
+    auto skip_str = [&]() {
+        unsigned long long n = 0;
+        return rd(&n, 8) && n < (1ull << 32) && skip(n);
+    };
+    char magic[4];
+    uint32_t ver = 0;
+    unsigned long long nt = 0, nkv = 0;
+    bool ok = rd(magic, 4) && memcmp(magic, "GGUF", 4) == 0 && rd(&ver, 4) && ver >= 2 &&
+              rd(&nt, 8) && rd(&nkv, 8) && nt < 100000 && nkv < 100000;
+    for (unsigned long long i = 0; ok && i < nkv; i++) {
+        uint32_t t = 0;
+        ok = skip_str() && rd(&t, 4);
+        if (!ok) break;
+        if (t == 8) {
+            ok = skip_str();
+        } else if (t == 9) {
+            uint32_t at = 0;
+            unsigned long long n = 0;
+            ok = rd(&at, 4) && rd(&n, 8);
+            if (!ok) break;
+            if (at == 8) {
+                for (unsigned long long j = 0; ok && j < n; j++) ok = skip_str();
+            } else {
+                const unsigned es = scalar_size(at);
+                ok = es && skip(n * es);
+            }
+        } else {
+            const unsigned es = scalar_size(t);
+            ok = es && skip(es);
+        }
+    }
+    for (unsigned long long i = 0; ok && i < nt; i++) {
+        unsigned long long n = 0;
+        ok = rd(&n, 8) && n < 4096;
+        if (!ok) break;
+        std::string nm(n, '\0');
+        uint32_t nd = 0, type = 0;
+        unsigned long long ne[4] = {1, 1, 1, 1}, off = 0;
+        ok = rd(&nm[0], n) && rd(&nd, 4) && nd <= 4;
+        for (uint32_t d = 0; ok && d < nd; d++) ok = rd(&ne[d], 8);
+        ok = ok && rd(&type, 4) && rd(&off, 8);
+        if (!ok || nm != name) continue;
+        unsigned be = 0, bb = 0;
+        switch (type) {
+            case 0: be = 1; bb = 4; break;      // F32
+            case 1: case 30: be = 1; bb = 2; break;  // F16 / BF16
+            case 7: be = 32; bb = 24; break;    // Q5_1
+            case 8: be = 32; bb = 34; break;    // Q8_0
+            case 12: be = 256; bb = 144; break; // Q4_K
+            case 13: be = 256; bb = 176; break; // Q5_K
+            case 14: be = 256; bb = 210; break; // Q6_K
+            case 20: be = 32; bb = 18; break;   // IQ4_NL
+            case 21: be = 256; bb = 110; break; // IQ3_S
+            case 23: be = 256; bb = 136; break; // IQ4_XS
+            default: break;
+        }
+        if (be) out = ne[0] * ne[1] * ne[2] * ne[3] / be * bb;
+        break;
+    }
+    fclose(f);
+    return out;
+}
+
+// GGUF 多分片：逐个分片找张量（name-00001-of-0000N.gguf 命名，同 gguf_shards_size）。
+unsigned long long gguf_tensor_bytes(const std::string& first, const char* name) {
+    const size_t of = first.find("-of-");
+    size_t dash = std::string::npos;
+    if (of != std::string::npos && of > 0) dash = first.rfind('-', of - 1);
+    if (dash == std::string::npos) return gguf_tensor_bytes_in(first, name);
+    const int n = atoi(first.substr(of + 4).c_str());
+    for (int i = 1; i <= n && i < 1000; i++) {
+        char idx[16];
+        snprintf(idx, sizeof idx, "%05d", i);
+        const unsigned long long b =
+            gguf_tensor_bytes_in(first.substr(0, dash + 1) + idx + first.substr(of), name);
+        if (b) return b;
+    }
+    return 0;
+}
+
 std::string sniff_magic(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return "";
@@ -400,11 +498,8 @@ void check_weight(CheckLines& c, const char* label, const std::string& path,
     }
     unsigned long long size = 0;
     file_size_of(path, &size);
-    if (size < 100ull * 1024 * 1024) {
-        check_line(c, kLvFail, std::string(label) + TR("：文件异常小（", ": suspiciously small file (") +
-                                   std::to_string(size) + TR(" B）", " B): ") + path);
-        return;
-    }
+    // 不按大小判定：合法 sidecar 可以很小（转换脚本产出的 MTP 仅 ~93 MB），
+    // 真坏的文件引擎加载时会报错
     // magic 嗅探：.hgn → HGN1（src/hgn.h），.gguf → GGUF；其它扩展名跳过
     const size_t dot = path.find_last_of('.');
     const std::string ext =
@@ -440,11 +535,13 @@ void check_weights_page(CheckLines& c, const PanelVals& v) {
                           "GGUF shards: the first shard is entered; keep the rest in the same "
                           "directory"));
         else
-            check_line(c, kLvWarn,
-                       TR("GGUF_FILE 文件名不含 -00001-of-XXXXX 分片命名；多分片模型请填第 1 "
-                          "个分片",
-                          "GGUF_FILE name lacks the -00001-of-XXXXX pattern; for multi-shard "
-                          "models enter the first shard"));
+            // 单文件 GGUF（未分片，或 llama-gguf-split --merge 合并后）是合法的：
+            // 引擎只在文件名形如 -0000i-of-0000N.gguf 时按分片打开，否则按单文件打开
+            check_line(c, kLvHint,
+                       TR("GGUF_FILE 按单文件加载（文件名不含 -00001-of-XXXXX）；若是多分片模型，"
+                          "请填第 1 个分片",
+                          "GGUF_FILE is loaded as a single file (no -00001-of-XXXXX in the name); "
+                          "for a multi-shard model enter the first shard"));
         if (v.no_gguf_mtp)
             check_line(c, kLvPass, TR("GGUF MTP：不使用", "GGUF MTP: not used"));
         else
@@ -453,11 +550,9 @@ void check_weights_page(CheckLines& c, const PanelVals& v) {
             check_line(c, kLvPass, TR("GGUF 视觉塔：不使用", "GGUF vision tower: not used"));
         else
             check_weight(c, TR("GGUF 视觉塔", "GGUF vision tower"), v.gguf_vision, true, false);
-        check_line(c, kLvWarn,
-                   TR("本机服务由 start_win.exe 启动（只支持 hgn 权重）；GGUF 配置仅保存"
-                      "（Linux 用 bash start_gguf.sh 启动）",
-                      "the local service is started by start_win.exe (hgn weights only); the "
-                      "GGUF config is saved only (on Linux use bash start_gguf.sh)"));
+        check_line(c, kLvHint,
+                   TR("GGUF 支持 Unsloth UD-Q4_K_XL / UD-IQ4_XS（Windows 已验证 UD-IQ4_XS）",
+                      "GGUF: Unsloth UD-Q4_K_XL / UD-IQ4_XS (UD-IQ4_XS verified on Windows)"));
     } else {
         check_weight(c, TR("主模型", "Main model"), v.model, true, false);
         if (v.weights_ver == kVerV2) {
@@ -572,8 +667,8 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
                                       " exceeds the KV pool KV_POOL_TOKENS=") +
                                    std::to_string(kv_pool) +
                                    TR("；调小上限或调大总池", "; lower the cap or grow the pool"));
-    // Windows 设备内存是硬上限 95 GiB 的 arena：512K 池（45,696 B/token ≈ 22.3 GiB）
-    // 已是权重 62.1 GiB + prefill 工作区 6.9 GiB 之后放得下的上限。有效值 = max(池, 上限)
+    // Windows 设备内存是硬上限 95 GiB 的 arena：v2 权重 512K 池实测用 92.2（2 路）–93.8（8 路）
+    // GiB，已是放得下的上限。有效值 = max(池, 上限)
     // （0 = 跟随，上限超 512K 时跟随逻辑同样会把池顶超）。
     const long pool_eff = kv_pool > maxctx ? kv_pool : maxctx;
     if (pool_eff > 524288)
@@ -745,14 +840,29 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
             unsigned long long s = 0;
             if (!f.empty() && file_size_of(f, &s)) extra += s;
         }
+        // 非 shared 版 MTP sidecar 自带 token_embd / output，引擎不读（草稿头沿用主干的
+        // embed 与 lm_head），不进显存：mtp-…-Q8_0.gguf 3.85 GiB 文件实测只占 2.6 GiB。
+        if (!side[0].empty()) {
+            const unsigned long long unread = gguf_tensor_bytes_in(side[0], "token_embd.weight") +
+                                              gguf_tensor_bytes_in(side[0], "output.weight");
+            if (unread < extra) extra -= unread;
+        }
         if (extra) {
             weights += extra;
             check_line(c, kLvHint, TR("GGUF sidecar（MTP/视觉塔）：", "GGUF sidecars (MTP/vision): ") +
                                        gib((double)extra) + " GiB");
         }
-        check_line(c, kLvHint,
-                   TR("GGUF 配置在 Windows 不启动，本页估算仅供 Linux 参考",
-                      "GGUF configs do not start on Windows; estimates here are for Linux reference"));
+        // n-gram 表（per_layer_token_embd，IQ4_NL）在分片里，按需读盘不驻留显存：
+        // 从驻留口径里减掉（与 v1 内嵌表同理）
+        const unsigned long long ple = gguf_tensor_bytes(v.gguf, "per_layer_token_embd.weight");
+        if (ple && ple < weights) {
+            weights -= ple;
+            check_line(c, kLvHint,
+                       TR("n-gram 表（GGUF 内）：", "n-gram table (in the GGUF): ") +
+                           gib((double)ple) +
+                           TR(" GiB，磁盘分页按需读取，不驻留显存",
+                              " GiB, disk-paged on demand, not VRAM-resident"));
+        }
     } else {
         // n-gram 表是磁盘分页的（引擎按需 gather，只有小 staging 驻留），
         // 单列且不计入显存估算：v2 是独立文件（直接不算进 weights）；
@@ -765,9 +875,14 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
             (v.weights_ver == kVerV1 && file_exists(v.model))
                 ? hgn_tensor_bytes(v.model, "layers.1.ple.ngram_embedding.weight")
                 : 0;
+        // 主模型自带 MTP 草稿头（v2 主体即是）时，MTP 文件只替换同名张量、不额外占显存
+        //（v2 带不带 mtp.hgn 实测 weight arena 都是 62.1 GiB）
+        const bool model_has_mtp =
+            file_exists(v.model) && hgn_tensor_bytes(v.model, "mtp.fc_hidden.weight") > 0;
         const std::string files[] = {v.model,
                                      v.weights_ver == kVerV2 ? "" : (v.no_overlay ? "" : v.overlay),
-                                     v.no_mtp ? "" : v.mtp, v.no_vision ? "" : v.vision};
+                                     (v.no_mtp || model_has_mtp) ? "" : v.mtp,
+                                     v.no_vision ? "" : v.vision};
         std::vector<std::string> uniq;
         for (const std::string& f : files) {
             if (f.empty() || !file_exists(f)) continue;
@@ -785,6 +900,11 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
         }
         check_line(c, kLvHint, TR("权重文件：", "Weight files: ") + std::to_string(uniq.size()) +
                                    TR(" 个合计 ", " totaling ") + gib((double)weights) + " GiB");
+        if (model_has_mtp && !v.no_mtp && !v.mtp.empty())
+            check_line(c, kLvHint,
+                       TR("主模型已带 MTP 草稿头：MTP 文件只替换同名张量，不另计显存",
+                          "The main model already has the MTP draft head: the MTP file only "
+                          "replaces those tensors and adds no VRAM"));
         if (ngram_bytes)
             check_line(c, kLvHint,
                        TR("n-gram 表：", "n-gram table: ") + gib((double)ngram_bytes) +
@@ -800,24 +920,35 @@ void check_vram_page(CheckLines& c, const PanelVals& v, bool service_running) {
         if (ngram_embedded < weights) weights -= ngram_embedded;
     }
 
-    // 显存估算（系数来自 src/gpu/parts/40_model.inc 分配代码核算，2026-10：
-    // 45,696 B/token = 12 QSA 层 + 1 MTP 层的 BF16 KV + BTV 转置 V +
-    // index f16 twin + d_iscores；512K 实机 ≈ 22.3 GiB 吻合）。
-    const double kKvBytesPerToken = 45696.0;
+    // 显存估算（系数按 src/gpu/parts/40_model.inc 分配代码核算，并与 2026-10-13 Windows
+    // 实测 arena 用量对齐：v2 256K/4 路 82.6、512K 池/2 路 92.2、/8 路 93.8、YaRN 512K/2 路
+    // 93.3 GiB，估算误差 < 0.5 GiB）：
+    // - 页池：41,408 B/token = 12 QSA 层 + 1 MTP 层的 BF16 KV + BTV 转置 V + 索引键（含 f16 twin）
+    // - 单条上限：4,288 B/token = d_iscores（INDEX_BATCH 1024 × 4 B）+ d_ikg/d_ikgh，按 maxctx 分配
+    // - 每路 0.27 GiB：GDN 状态 + 会合 verify 行窗口备份 + MTP 流状态（2 路→8 路实测 +1.6 GiB）
+    // - 固定 0.5 GiB：其余小缓冲
+    const double kKvPoolBytesPerToken = 41408.0;
+    const double kKvCtxBytesPerToken = 4288.0;
     // 0 = 跟随 MAX_CONTEXT；std::max 与 windows.h 的 max 宏冲突，手写比较
     const double pool_tokens = (double)(kv_pool > maxctx ? kv_pool : maxctx);
-    const double kv_bytes = pool_tokens * kKvBytesPerToken;
-    const double chunk = prefill > 0 ? (double)prefill : 8192.0;
+    const double kv_bytes = pool_tokens * kKvPoolBytesPerToken;
+    const double ctx_bytes = (double)maxctx * kKvCtxBytesPerToken;
+    const double chunk = prefill > 0 ? (double)prefill : 6144.0;  // 引擎 Windows 默认
     const double ws_bytes = chunk / 8192.0 * 6.9 * 1073741824.0;  // 8192≈6.9 GiB 实测
-    const double gdn_bytes = parallel * 0.12 * 1073741824.0;      // 每路 GDN 状态
-    const double total = (double)weights + kv_bytes + ws_bytes + gdn_bytes;
+    const double gdn_bytes = parallel * 0.27 * 1073741824.0;      // 每路状态
+    const double misc_bytes = 0.5 * 1073741824.0;
+    const double total = (double)weights + kv_bytes + ctx_bytes + ws_bytes + gdn_bytes + misc_bytes;
     check_line(c, kLvHint, TR("并发总池：", "KV pool: ") + std::to_string((long)pool_tokens) +
-                               TR(" token × 44.6 KiB ≈ ", " tokens × 44.6 KiB ≈ ") + gib(kv_bytes) +
+                               TR(" token × 40.4 KiB ≈ ", " tokens × 40.4 KiB ≈ ") + gib(kv_bytes) +
+                               " GiB");
+    check_line(c, kLvHint, TR("索引打分缓冲：单条上限 ", "Index score buffers: per-request cap ") +
+                               std::to_string(maxctx) +
+                               TR(" token × 4.2 KiB ≈ ", " tokens × 4.2 KiB ≈ ") + gib(ctx_bytes) +
                                " GiB");
     check_line(c, kLvHint, TR("prefill 工作区：chunk ", "Prefill workspace: chunk ") +
                                std::to_string((long)chunk) + " ≈ " + gib(ws_bytes) + " GiB");
-    check_line(c, kLvHint, TR("并发 GDN 状态：", "Parallel GDN state: ") +
-                               std::to_string(parallel) + TR(" 路 ≈ ", " streams ≈ ") +
+    check_line(c, kLvHint, TR("每路状态（GDN、verify 备份等）：", "Per-slot state (GDN, verify backup, etc.): ") +
+                               std::to_string(parallel) + TR(" 路 × 0.27 ≈ ", " slots × 0.27 ≈ ") +
                                gib(gdn_bytes) + " GiB");
     if (!hip_ok) {
         // 查不到显存也要给出估算总量 —— 它不依赖 HIP 查询，只有对比结论需要
@@ -1085,11 +1216,9 @@ void refresh_outputs(const PanelVals& v, const AllChecks& c) {
                 s += std::string(names[i]) + TR("：", ": ") + f + "\r\n";
     }
     if (v.weights_ver == kVerGguf)
-        s += TR("已选 GGUF 权重：本机服务由 start_win.exe 启动（只支持 hgn），配置仅保存"
-                "（Linux 用 bash start_gguf.sh 启动）。\r\n",
-                "GGUF weights selected: the local service is started by start_win.exe (hgn "
-                "weights only); the config is saved only (on Linux use bash "
-                "start_gguf.sh).\r\n");
+        s += TR("已选 GGUF 权重：服务按 GGUF 首分片启动（其余分片须在同一目录）。\r\n",
+                "GGUF weights selected: the service starts from the first GGUF shard (keep the "
+                "other shards in the same folder).\r\n");
     set_edit(g_pc.summary, s);
 }
 
@@ -1211,16 +1340,37 @@ void layout_page1(int ver) {
             if (order[i] == r) shown = true;
         if (!shown) place_row(*r, 0, false);
     }
-    SetWindowPos(g_pc.tok_hint, nullptr, kEdX + g_art_w, y + 2, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
-    SetWindowPos(g_pc.ver_note, nullptr, kEdX + g_art_w, y + 24, 434, 18, SWP_NOZORDER | SWP_SHOWWINDOW);
+    // tok_hint / ver_note 是透明底 Static（HOLLOW_BRUSH），自身重绘不擦底：
+    // 改字或挪位后须让父窗口把新旧位置的并集贴回背景再画控件，否则旧文字
+    // 残留、与新文字叠印。先记下挪动前的位置。
+    HWND parent = GetParent(g_pc.ver_note);
+    auto rect_in_parent = [parent](HWND c) {
+        RECT r;
+        GetWindowRect(c, &r);
+        MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&r), 2);
+        return r;
+    };
+    RECT dirty = rect_in_parent(g_pc.tok_hint);
+    RECT tmp = rect_in_parent(g_pc.ver_note);
+    UnionRect(&dirty, &dirty, &tmp);
+    SetWindowPos(g_pc.tok_hint, nullptr, kEdX + g_art_w, y + 2, 434, 18,
+                 SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+    SetWindowPos(g_pc.ver_note, nullptr, kEdX + g_art_w, y + 24, 434, 18,
+                 SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
     SetWindowTextW(g_pc.ver_note, ver == kVerGguf
-                                      ? TR(L"GGUF：仅保存配置，启动需 Linux bash start_gguf.sh",
-                                           L"GGUF: config saved only; start on Linux via bash start_gguf.sh")
+                                      ? TR(L"GGUF：填第 1 个分片；MTP/视觉塔可留空不用",
+                                           L"GGUF: enter the first shard; MTP/vision may be left off")
                                       : ver == kVerV2
                                             ? TR(L"V2：主体+独立 n-gram 文件；overlay 无效（保存置空）",
                                                  L"V2: main + separate n-gram file; overlay ignored (cleared on save)")
                                             : TR(L"V1：w4b 单文件，n-gram 内置；overlay/MTP/视觉塔可选",
                                                  L"V1: single w4b file, built-in n-gram; overlay/MTP/vision optional"));
+    tmp = rect_in_parent(g_pc.tok_hint);
+    UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.ver_note);
+    UnionRect(&dirty, &dirty, &tmp);
+    RedrawWindow(parent, &dirty, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 void show_page(int idx) {
@@ -1579,7 +1729,7 @@ PanelResult panel_run() {
         wc.cbSize = sizeof wc;
         wc.lpfnWndProc = panel_proc;
         wc.hInstance = hi;
-        wc.lpszClassName = L"gfx1151_setup_panel";
+        wc.lpszClassName = L"Qwenox_setup_panel";
         wc.hbrBackground = g_panel_bg;
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
         // 窗口图标（任务栏按钮用）：内嵌 ICO，否则任务栏是空白默认图标
@@ -1598,8 +1748,8 @@ PanelResult panel_run() {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     const int wx = work.left + (work.right - work.left - win_w) / 2;
     const int wy = work.top + (work.bottom - work.top - win_h) / 2;
-    HWND h = CreateWindowExW(0, L"gfx1151_setup_panel",
-                             TR(L"gfx1151-engine 设置", L"gfx1151-engine Settings"),
+    HWND h = CreateWindowExW(0, L"Qwenox_setup_panel",
+                             TR(L"Qwenox 设置", L"Qwenox Settings"),
                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, wx, wy, win_w, win_h,
                              nullptr, nullptr, hi, nullptr);
     if (!h) {
@@ -1714,8 +1864,8 @@ PanelResult panel_run() {
     g_pc.prefill = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
                         22, L"", kEdPrefill);
     set_edit(g_pc.prefill, init.prefill_chunk);
-    plabel(1, h, kHintX, y2, TR(L"0 = 默认 8192（≈6.9 GiB 工作区）",
-                                L"0 = default 8192 (≈6.9 GiB workspace)"),
+    plabel(1, h, kHintX, y2, TR(L"0 = 默认 6144（≈5.2 GiB 工作区）",
+                                L"0 = default 6144 (≈5.2 GiB workspace)"),
            kHintW);
     y2 += 26;
     {

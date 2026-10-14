@@ -2,7 +2,8 @@
 // Batch-1: one connection, one in-flight request. Verbs:
 // PING / INFO / MEM / GEN / X / KVSYNC.
 // GEN accepts an optional SAMPLE suffix (temp>0, top_k/top_p/min_p/seed) with
-// PENALTY/BIAS/LOGPROBS as sampler-only companions; drafter>0 is rejected.
+// PENALTY/BIAS/LOGPROBS as sampler-only companions (SEEDED: the seed is the
+// client's, keep the output reproducible under concurrency); drafter>0 is rejected.
 // INFO reports sampling on, prompt cache on, kv_slots=1. MEM reports tracked
 // HIP allocations plus driver/process corroborating counters.
 // The verb grammars below (parse_gen, INFO fields) are the specification.

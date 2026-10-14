@@ -23,7 +23,7 @@ ROCm 需要支持 `gfx1151` 的版本。不要把 GPU 架构参数直接套用�
 ```bash
 bash build.sh                 # all:引擎 + benchmark + API 并行编译(默认)
 bash build.sh --bundle        # 分发构建：同时打包全部运行依赖
-bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 qwenox)
+bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 qwenox-engine)
 bash build.sh bench           # 只编独立性能测试工具
 bash build.sh api             # 只编 API 服务器 + CLI 工具
 bash build.sh test            # 编 ktest 并运行 kernel 单测
@@ -182,8 +182,8 @@ API 自己的输出写入 `logs\api-win-*.log`，引擎输出写入 `logs\engine
 手动启动，或用托盘右键菜单启停。旧版带配置面板的启动器已归档到
 `attic/launcher/`，不再编译维护。
 
-**配置改根目录 `service.conf`**（与 Linux 启动器同一个文件；Windows 目前只支持 hgn，
-读其中"hgn 权重"一段，GGUF 一段不生效）：可直接编辑，也可在控制台 `#/engine`
+**配置改根目录 `service.conf`**（与 Linux 启动器同一个文件；Windows 默认读"hgn 权重"一段，
+控制台选 GGUF 后改读 GGUF 一段，只支持 UD-IQ4_XS）：可直接编辑，也可在控制台 `#/engine`
 页编辑（写前备份 `service.conf.bak`，保存后下次启动引擎生效）；优先级为
 环境变量 > service.conf > 内置默认。客户端连
 `http://127.0.0.1:8731/v1`（标准 OpenAI 接口，含流式）；8730 是引擎内部
@@ -212,8 +212,8 @@ Git Bash。首次构建会把运行期全部依赖备进 `build/`：TheRock DLL 
 运行时 ×3、rocBLAS/hipBLASLt 的 gfx1151 kernel db 真身（共 ~30M，非全架构
 1.2G）。**产物自包含：`build/` 拷到任何同架构 Windows 机器即用，无需安装
 ROCm/TheRock，也不设 HIP_PATH/ROCM_PATH**（断根实测见 PORTING-WINDOWS.md）。
-GPU 需 BIOS 划分足够显存（heretic 68 GiB 权重 + 256K 上下文实测顶格 95 GiB，
-划分 96 GiB）。`start_win.exe` / `start_win.sh` 与 Linux 启动器共用根目录
+GPU 需在 BIOS 划分 96 GiB 显存（引擎可用约 95 GiB；v2 权重 256K 上下文实测用 82.6 GiB，
+512K 页池用 92–94 GiB，见 README「Windows」一节）。`start_win.exe` / `start_win.sh` 与 Linux 启动器共用根目录
 `service.conf`（模型路径、端口、上下文窗口等都在里面改，环境变量可临时覆盖）。
 
 ## 可选工具与常见编译问题

@@ -1,6 +1,6 @@
 # Prefill 实现说明（PP 性能优化基线文档）
 
-本文档固化 gfx1151-engine prefill 阶段的实现方案，作为后续 PP（prefill
+本文档固化 Qwenox prefill 阶段的实现方案，作为后续 PP（prefill
 performance）优化工作的基线，避免重复调研。所有行号基于当前 HEAD 的
 `src/gpu/qwenox.cpp`（14064 行，kernel 与 host 编排同文件）；文件头注释
 （`qwenox.cpp:1-59`）本身是 prefill 优化史（Phase 3a–3f）的索引，改动

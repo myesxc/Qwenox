@@ -191,7 +191,7 @@ serve_run() {
   exec 9>logs/.service.lock
   flock -n 9 || fail '本目录已有启动脚本在运行'
   exec 8>"${XDG_RUNTIME_DIR:-/run/user/$UID}/hgn-work.lock"
-  flock -n 8 || fail '另一个 gfx1151-engine 编译或启动任务正在运行'
+  flock -n 8 || fail '另一个 Qwenox 编译或启动任务正在运行'
   RUN_LOG_DIR="logs/$(date +%Y%m%d-%H%M%S)-$$"
   mkdir "$RUN_LOG_DIR"
   ENGINE_LOG="$RUN_LOG_DIR/engine.log"

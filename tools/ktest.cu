@@ -54,6 +54,132 @@ static void check_close(const char* name, const std::vector<float>& actual,
   if (!ok) fails++;
 }
 
+struct GdnError {
+  double maxabs = 0, maxrel = 0, err2 = 0, ref2 = 0;
+  size_t different = 0, nonfinite = 0, worst = 0;
+  uint64_t maxulp = 0;
+  float worst_ref = 0, worst_got = 0;
+
+  void add(float ref, float got, size_t at) {
+    if (!std::isfinite(ref) || !std::isfinite(got)) {
+      nonfinite++;
+      return;
+    }
+    uint32_t rb, gb;
+    memcpy(&rb, &ref, sizeof rb);
+    memcpy(&gb, &got, sizeof gb);
+    different += rb != gb;
+    // 将浮点位模式映射为有序整数，以便比较跨零点的 ULP 距离。
+    const uint32_t ro = (rb & 0x80000000u) ? ~rb : rb ^ 0x80000000u;
+    const uint32_t go = (gb & 0x80000000u) ? ~gb : gb ^ 0x80000000u;
+    maxulp = std::max(maxulp, ro > go ? uint64_t(ro) - go : uint64_t(go) - ro);
+    const double error = fabs((double)ref - got);
+    if (error > maxabs) {
+      maxabs = error;
+      worst = at;
+      worst_ref = ref;
+      worst_got = got;
+    }
+    if (fabs((double)ref) > 1e-3)
+      maxrel = std::max(maxrel, error / fabs((double)ref));
+    err2 += error * error;
+    ref2 += (double)ref * ref;
+  }
+
+  double frorel() const {
+    return ref2 > 0 ? sqrt(err2 / ref2) : (err2 == 0 ? 0 : INFINITY);
+  }
+};
+
+struct GdnComparison {
+  GdnError out, state;
+  size_t qk_bad = 0, qk_nonfinite = 0;
+
+  bool within_tolerance() const {
+    return !out.nonfinite && !state.nonfinite && !qk_nonfinite && !qk_bad &&
+           out.maxabs <= 2e-3 && out.maxrel <= 2e-2 && state.maxabs <= 2e-3;
+  }
+};
+
+static GdnComparison gdn_compare(const std::vector<float>& input,
+                                 const std::vector<float>& ref,
+                                 const std::vector<float>& got,
+                                 const std::vector<float>& ref_s,
+                                 const std::vector<float>& got_s, int P) {
+  GdnComparison result;
+  result.out.worst = 4096;
+  for (int t = 0; t < P; t++) {
+    const size_t row = (size_t)t * 10240;
+    for (int i = 0; i < 4096; i++) {
+      const size_t at = row + i;
+      result.qk_bad += memcmp(&input[at], &ref[at], sizeof(float)) != 0 ||
+                       memcmp(&input[at], &got[at], sizeof(float)) != 0;
+      result.qk_nonfinite += !std::isfinite(ref[at]) || !std::isfinite(got[at]);
+    }
+    for (int i = 4096; i < 10240; i++)
+      result.out.add(ref[row + i], got[row + i], row + i);
+  }
+  for (size_t i = 0; i < ref_s.size(); i++)
+    result.state.add(ref_s[i], got_s[i], i);
+  return result;
+}
+
+static void print_gdn_comparison(const char* name, const char* reference,
+                                 const GdnComparison& c) {
+  printf("%s vs=%s out_abs=%.3e out_rel=%.3e S_abs=%.3e "
+         "out_ulp=%llu S_ulp=%llu out_diff=%zu S_diff=%zu "
+         "out_fro=%.3e S_fro=%.3e qk_bad=%zu nonfinite=%zu within=%d\n",
+         name, reference, c.out.maxabs, c.out.maxrel, c.state.maxabs,
+         (unsigned long long)c.out.maxulp, (unsigned long long)c.state.maxulp,
+         c.out.different, c.state.different, c.out.frorel(), c.state.frorel(),
+         c.qk_bad, c.out.nonfinite + c.state.nonfinite + c.qk_nonfinite,
+         (int)c.within_tolerance());
+  if (c.out.different || c.state.different)
+    printf("  worst V[t=%zu,h=%zu,d=%zu] ref=%.9g got=%.9g; "
+           "S[h=%zu,k=%zu,v=%zu] ref=%.9g got=%.9g\n",
+           c.out.worst / 10240, (c.out.worst % 10240 - 4096) / 128,
+           c.out.worst % 128, c.out.worst_ref, c.out.worst_got,
+           c.state.worst / (128 * 128), c.state.worst / 128 % 128,
+           c.state.worst % 128, c.state.worst_ref, c.state.worst_got);
+}
+
+static void gdn_comparison_selftest() {
+  std::vector<float> input(10240, 0.f), ref = input, state(2, 1.f);
+  ref[4096] = 1.f;
+  bool ok = gdn_compare(input, ref, ref, state, state, 1).within_tolerance();
+  auto got = ref;
+  got[4096] += 1e-4f;
+  ok &= gdn_compare(input, ref, got, state, state, 1).within_tolerance();
+  for (float bad : {NAN, INFINITY, -INFINITY}) {
+    got = ref;
+    got[4096] = bad;
+    ok &= !gdn_compare(input, ref, got, state, state, 1).within_tolerance();
+    ok &= !gdn_compare(input, got, ref, state, state, 1).within_tolerance();
+    auto bad_s = state;
+    bad_s[0] = bad;
+    ok &= !gdn_compare(input, ref, ref, state, bad_s, 1).within_tolerance();
+    ok &= !gdn_compare(input, ref, ref, bad_s, state, 1).within_tolerance();
+  }
+  got = ref;
+  got[4096] += 1e-2f;
+  ok &= !gdn_compare(input, ref, got, state, state, 1).within_tolerance();
+  auto bad_s = state;
+  bad_s[0] += 1e-2f;
+  ok &= !gdn_compare(input, ref, ref, state, bad_s, 1).within_tolerance();
+  auto small_ref = ref;
+  small_ref[4096] = 1e-2f;
+  got = small_ref;
+  got[4096] += 1e-3f;
+  ok &= !gdn_compare(input, small_ref, got, state, state, 1).within_tolerance();
+  got = ref;
+  const uint32_t one_bit = 1;
+  memcpy(got.data(), &one_bit, sizeof one_bit);
+  ok &= !gdn_compare(input, ref, got, state, state, 1).within_tolerance();
+  ok &= !gdn_compare(input, got, ref, state, state, 1).within_tolerance();
+  printf("%-28s %s\n", "gdn_comparison_guards", ok ? "PASS" : "FAIL");
+  fails += !ok;
+}
+
 // CPU references -----------------------------------------------------------
 static float bf16_round(float f) {  // RNE, same as f2bf
   uint32_t u;
@@ -1275,6 +1401,369 @@ int main() {
     }
   }
 
+  // ---- 1h. gemv_multi 全 P 行不变性（D2-S1b）--------------------------------
+  // 性质：同一 x 行内容，在批 P=1..48 的任意行位 / 分块下，y 行必须逐位
+  // 相同。参考 = 每行单独跑 P=1；P=2..48 全量逐位比对（P>8 走 le8 的 8 行
+  // 分块，顺带锁定分块路径；S3b 把 PMAX 锁到 gemvmr_maxp 上限 48）。覆盖生产 v2 的 ht 全形状族（ks 分裂 / tpc
+  // 分级）与 q6g64 的 LPR=8 / LPR=32 / split-K 门控（C>=4096 && R<=2048）
+  // 分支；q4cp / q8g32 / bf16-rowfast 抽查分块路径。
+  {
+    std::mt19937 rng(0x51b);
+    auto frand = [&] { return std::uniform_real_distribution<float>(-1.f, 1.f)(rng); };
+    if (!g_ht_zs) {  // ht / q6g64 split-K scratch（生产由 v2_init 分配）
+      TCK(hipMalloc(&g_ht_zs, kHtZs * 4));
+      TCK(hipMemset(g_ht_zs, 0, kHtZs * 4));
+      TCK(hipMalloc(&g_ht_cnt, 4096 * 4));
+      TCK(hipMemset(g_ht_cnt, 0, 4096 * 4));
+    }
+    if (!g_q6g_part) TCK(hipMalloc(&g_q6g_part, (size_t)16 * 8 * 2048 * 4));
+    constexpr int PMAX = 48;  // S3b: 锁到 gemvmr_maxp 上限（6 个 8 行块组合）
+    // runP(P, r0, dy)：x 第 r0 行起的 P 行过 gemv_multi_q4cp（ys = N）。
+    auto audit_full = [&](const char* name, uint64_t N, auto runP, float* dy) {
+      std::vector<float> yref((size_t)PMAX * N);
+      for (int r = 0; r < PMAX; r++) {
+        runP(1, r, dy);
+        TCK(hipMemcpy(yref.data() + (size_t)r * N, dy, N * 4,
+                      hipMemcpyDeviceToHost));
+      }
+      size_t m = 0;
+      int firstbad = -1, badrow = -1;
+      for (int P = 2; P <= PMAX; P++) {
+        runP(P, 0, dy);
+        std::vector<float> yP = dget(dy, (size_t)P * N);
+        for (size_t i = 0; i < yP.size(); i++)
+          if (yP[i] != yref[i]) {
+            m++;
+            if (firstbad < 0) { firstbad = P; badrow = (int)(i / N); }
+          }
+      }
+      printf("ri_%-23s mism=%-9zu firstbad=P%d:row%d %s\n", name, m, firstbad,
+             badrow, m ? "FAIL" : "PASS");
+      if (m) fails++;
+    };
+
+    // ht (dtype 16)：生产形状族 {512x2560, 640x2560, 2560x640, 2560x6144,
+    // 6144x2560, 10240x2560, 12288x2560, 248320x2560}（ks = 20/10/4/4/2/1/1/1；
+    // 640x2560 是 shared_expert gate_proj（nty=5 的 split-K 档），248320x2560
+    // 是 lm_head 本体）。随机 bytes 对 ht 解码均合法。
+    for (int xbf = 0; xbf <= 1; xbf++) {
+      const int shapes[][2] = {{512, 2560},   {640, 2560},   {2560, 640},
+                               {2560, 6144},  {6144, 2560},  {10240, 2560},
+                               {12288, 2560}, {248320, 2560}};
+      for (const auto& sh : shapes) {
+        const int O = sh[0], K = sh[1];
+        std::vector<uint8_t> codes((size_t)(O / 128) * (K / 128) * 8192);
+        for (auto& v : codes) v = (uint8_t)rng();
+        std::vector<float> suh(K), svh(O);
+        for (auto& v : suh) v = 0.02f * frand();
+        for (auto& v : svh) v = 0.5f + 0.5f * frand();
+        std::vector<float> xf((size_t)PMAX * K);
+        for (auto& v : xf) v = frand();
+        std::vector<uint16_t> xb(xf.size());
+        for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+        uint8_t* dw = dup(codes);
+        float *dsuh = dup(suh), *dsvh = dup(svh), *dxf = dup(xf);
+        uint16_t* dxb = dup(xb);
+        float* dy = dalloc((size_t)PMAX * O);
+        WView w;
+        w.dtype = 16;
+        w.data = dw;
+        w.rows = O;
+        w.cols = K;
+        w.scale_stride = 0;
+        w.suh = dsuh;
+        w.svh = dsvh;
+        auto runP = [&](int P, int r0, float* y) {
+          const void* xp = xbf ? (const void*)(dxb + (size_t)r0 * K)
+                               : (const void*)(dxf + (size_t)r0 * K);
+          if (!gemv_multi_q4cp(w, xp, y, P, K, xbf != 0)) {
+            printf("  ri_ht %dx%d: dispatch refused P=%d\n", O, K, P);
+            fails++;
+          }
+        };
+        char nm[64];
+        snprintf(nm, sizeof nm, "ht_%dx%d%s", O, K, xbf ? "_bx" : "");
+        audit_full(nm, O, runP, dy);
+        TCK(hipFree(dw)); TCK(hipFree(dsuh)); TCK(hipFree(dsvh));
+        TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+      }
+    }
+
+    // q6g64 (dtype 24)：{320x10240, 4x10240} 命中 split-K 门控（生产 HC），
+    // {2048x2560} LPR=32，{10240x320} LPR=8。行布局：C/2 B 低 4 位 +
+    // C/4 B 高 2 位面 + C/64 x (f16 scale, f16 bias)，行距 align16(13C/16)。
+    for (int xbf = 0; xbf <= 1; xbf++) {
+      const int shapes[][2] = {{320, 10240}, {4, 10240}, {2048, 2560},
+                               {10240, 320}};
+      for (const auto& sh : shapes) {
+        const int R = sh[0], C = sh[1];
+        const uint64_t st = q6g64_stride(C);
+        std::vector<uint8_t> wbuf((size_t)R * st);
+        for (int r = 0; r < R; r++) {
+          uint8_t* rp = wbuf.data() + (size_t)r * st;
+          for (uint64_t i = 0; i < 3 * (uint64_t)C / 4; i++) rp[i] = (uint8_t)rng();
+          for (uint64_t g = 0; g < (uint64_t)C / 64; g++) {
+            __half hs = __float2half(0.01f + 0.005f * frand());
+            __half hb = __float2half(0.5f * frand());
+            memcpy(rp + 3 * (size_t)C / 4 + g * 4, &hs, 2);
+            memcpy(rp + 3 * (size_t)C / 4 + g * 4 + 2, &hb, 2);
+          }
+        }
+        std::vector<float> xf((size_t)PMAX * C);
+        for (auto& v : xf) v = frand();
+        std::vector<uint16_t> xb(xf.size());
+        for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+        uint8_t* dw = dup(wbuf);
+        float* dxf = dup(xf);
+        uint16_t* dxb = dup(xb);
+        float* dy = dalloc((size_t)PMAX * R);
+        WView w;
+        w.dtype = 24;
+        w.data = dw;
+        w.rows = R;
+        w.cols = C;
+        w.scale_stride = st;
+        auto runP = [&](int P, int r0, float* y) {
+          const void* xp = xbf ? (const void*)(dxb + (size_t)r0 * C)
+                               : (const void*)(dxf + (size_t)r0 * C);
+          if (!gemv_multi_q4cp(w, xp, y, P, C, xbf != 0)) {
+            printf("  ri_q6g64 %dx%d: dispatch refused P=%d\n", R, C, P);
+            fails++;
+          }
+        };
+        char nm[64];
+        snprintf(nm, sizeof nm, "q6g64_%dx%d%s", R, C, xbf ? "_bx" : "");
+        audit_full(nm, R, runP, dy);
+        TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+      }
+    }
+
+    // P>8 分块抽查（le8 内无 host 侧 P 参数，分块只是模板切换）：
+    // q4cp {128x1024, 1x2560, 48x2560}（后两个是生产形状：shared_expert_gate
+    // R=1 与 in_proj_a/b R=48）、q8g32 64x2560 float（lpr=16）、
+    // q8g32 320x6144 bf16 x（brow/brow_r 家族，P 3..5 走 brow_r）、
+    // bf16 rowfast 48x2560 bf16 x（k_bf16_gemv_row_mp）。
+    for (const auto& qsh : {std::pair<uint64_t, uint64_t>{128, 1024},
+                            {1, 2560}, {48, 2560}}) {
+      const uint64_t rows = qsh.first, cols = qsh.second,
+                     ss = ((cols / 32 * 2) + 15) & ~15ull;
+      for (int xbf = 0; xbf <= 1; xbf++) {
+        std::vector<uint8_t> w(64 + rows * cols / 2 + rows * ss);
+        std::vector<float> cb(16);
+        for (auto& v : cb) v = frand() * 2.f;
+        memcpy(w.data(), cb.data(), 64);
+        for (uint64_t i = 0; i < rows * cols / 2; i++) w[64 + i] = (uint8_t)rng();
+        __half* hs = (__half*)(w.data() + 64 + rows * cols / 2);
+        for (uint64_t i = 0; i < rows * cols / 32; i++)
+          hs[i] = __float2half(0.01f + 0.005f * frand());
+        std::vector<float> xf((size_t)PMAX * cols);
+        for (auto& v : xf) v = frand();
+        std::vector<uint16_t> xb(xf.size());
+        for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+        uint8_t* dw = dup(w);
+        float* dxf = dup(xf);
+        uint16_t* dxb = dup(xb);
+        float* dy = dalloc((size_t)PMAX * rows);
+        WView wv;
+        wv.dtype = 5;
+        wv.data = dw;
+        wv.rows = rows;
+        wv.cols = cols;
+        wv.scale_stride = ss;
+        auto runP = [&](int P, int r0, float* y) {
+          const void* xp = xbf ? (const void*)(dxb + (size_t)r0 * cols)
+                               : (const void*)(dxf + (size_t)r0 * cols);
+          if (!gemv_multi_q4cp(wv, xp, y, P, cols, xbf != 0)) {
+            printf("  ri_q4cp_chunk: dispatch refused P=%d\n", P);
+            fails++;
+          }
+        };
+        char qnm[64];
+        snprintf(qnm, sizeof qnm, "q4cp_chunk_%llux%llu%s",
+                 (unsigned long long)rows, (unsigned long long)cols,
+                 xbf ? "_bx" : "");
+        audit_full(qnm, rows, runP, dy);
+        TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+      }
+    }
+    for (int kind = 0; kind < 2; kind++) {  // 0 = multi lpr16 float x, 1 = brow 家族 bf16 x
+      const uint64_t rows = kind ? 320 : 64, cols = kind ? 6144 : 2560;
+      std::vector<uint8_t> w(rows * cols + rows * (cols / 32) * 2);
+      for (uint64_t i = 0; i < rows * cols; i++) w[i] = (uint8_t)rng();
+      __half* hs = (__half*)(w.data() + rows * cols);
+      for (uint64_t i = 0; i < rows * (cols / 32); i++)
+        hs[i] = __float2half(0.01f + 0.005f * frand());
+      std::vector<float> xf((size_t)PMAX * cols);
+      for (auto& v : xf) v = frand();
+      std::vector<uint16_t> xb(xf.size());
+      for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+      uint8_t* dw = dup(w);
+      float* dxf = dup(xf);
+      uint16_t* dxb = dup(xb);
+      float* dy = dalloc((size_t)PMAX * rows);
+      WView wv;
+      wv.dtype = 8;
+      wv.data = dw;
+      wv.rows = rows;
+      wv.cols = cols;
+      wv.scale_stride = 0;
+      auto runP = [&](int P, int r0, float* y) {
+        const void* xp = kind ? (const void*)(dxb + (size_t)r0 * cols)
+                              : (const void*)(dxf + (size_t)r0 * cols);
+        if (!gemv_multi_q4cp(wv, xp, y, P, cols, kind != 0)) {
+          printf("  ri_q8g32_chunk kind=%d: dispatch refused P=%d\n", kind, P);
+          fails++;
+        }
+      };
+      audit_full(kind ? "q8g32_chunk_brow" : "q8g32_chunk_lpr16", rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+    }
+    // bf16 mr（dtype 0，fp32 x）：生产形状 512x2560（mlp.gate router，
+    // k_bf16_gemv_mr 路径；g_dense_rowfast 此时仍为 false，rows=512>=64
+    // 也不会误中 rowfast 档）。
+    {
+      const uint64_t rows = 512, cols = 2560;
+      std::vector<uint16_t> w(rows * cols);
+      for (auto& v : w) v = bf16_bits(frand());
+      std::vector<float> xf((size_t)PMAX * cols);
+      for (auto& v : xf) v = frand();
+      uint16_t* dw = dup(w);
+      float* dxf = dup(xf);
+      float* dy = dalloc((size_t)PMAX * rows);
+      WView wv;
+      wv.dtype = 0;
+      wv.data = (const uint8_t*)dw;
+      wv.rows = rows;
+      wv.cols = cols;
+      wv.scale_stride = 0;
+      auto runP = [&](int P, int r0, float* y) {
+        const void* xp = (const void*)(dxf + (size_t)r0 * cols);
+        if (!gemv_multi_q4cp(wv, xp, y, P, cols, false)) {
+          printf("  ri_bf16_mr_512x2560: dispatch refused P=%d\n", P);
+          fails++;
+        }
+      };
+      audit_full("bf16_mr_512x2560", rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxf)); TCK(hipFree(dy));
+    }
+    {
+      const uint64_t rows = 48, cols = 2560;
+      g_dense_rowfast = true;  // 生产由 gguf_dense_apply 在加载时置位
+      std::vector<uint16_t> w(rows * cols);
+      for (auto& v : w) v = bf16_bits(frand());
+      std::vector<float> xf((size_t)PMAX * cols);
+      for (auto& v : xf) v = frand();
+      std::vector<uint16_t> xb(xf.size());
+      for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+      uint16_t* dw = dup(w);
+      uint16_t* dxb = dup(xb);
+      float* dy = dalloc((size_t)PMAX * rows);
+      WView wv;
+      wv.dtype = 0;
+      wv.data = (const uint8_t*)dw;
+      wv.rows = rows;
+      wv.cols = cols;
+      wv.scale_stride = 0;
+      auto runP = [&](int P, int r0, float* y) {
+        const void* xp = (const void*)(dxb + (size_t)r0 * cols);
+        if (!gemv_multi_q4cp(wv, xp, y, P, cols, true)) {
+          printf("  ri_bf16_rowfast: dispatch refused P=%d\n", P);
+          fails++;
+        }
+      };
+      audit_full("bf16_rowfast_chunk", rows, runP, dy);
+      TCK(hipFree(dw)); TCK(hipFree(dxb)); TCK(hipFree(dy));
+    }
+  }
+
+  // ---- 1i. k_qsa_wmma<TransposedV> P=3 vs P=4 行不变性（D2-S1b 复现）--------
+  // 引擎 verify 场景：base=8192，尾块 2048 的 slot 3 在 P=3 时被
+  // k_f32_to_bf16_v4_bt 写 0、P=4 时是真实 V（位置 8195）。三轮：
+  //   A: P=3 + slot3=0（γ=2 场景）   B: P=4 + slot3=real（γ=3 场景）
+  //   C: P=3 + slot3=real（同输入仅 P 变，分离 vct 差异与 grid/P 差异）
+  {
+    std::mt19937 rng(0x51c);
+    auto frand = [&] { return std::uniform_real_distribution<float>(-1.f, 1.f)(rng); };
+    const int base = 8192, HQ = 24, HKV = 2, DH = 256;
+    const int rows = 8448, nblk = rows / 4;
+    std::vector<int> ptab(33);  // 恒等页表（33 页 x 256）
+    for (int i = 0; i < 33; i++) ptab[i] = i;
+    int* dptab = dup(ptab);
+    std::vector<float> q((size_t)4 * HQ * DH);
+    for (auto& v : q) v = frand();
+    std::vector<int> sel((size_t)4 * 512);
+    for (int r = 0; r < 4; r++)
+      for (int i = 0; i < 512; i++) sel[(size_t)r * 512 + i] = (i * 4 + r) % 2048;
+    std::vector<uint16_t> kc((size_t)rows * HKV * DH), vc(kc.size());
+    for (auto& v : kc) v = bf16_bits(frand());
+    for (auto& v : vc) v = bf16_bits(frand());
+    std::vector<uint16_t> vctB((size_t)nblk * HKV * DH * 4);
+    for (int t = 0; t < rows; t++)
+      for (int j = 0; j < HKV * DH; j++)
+        vctB[((size_t)(t / 4) * HKV * DH + j) * 4 + t % 4] =
+            vc[(size_t)t * HKV * DH + j];
+    std::vector<uint16_t> vctA = vctB;  // P=3 场景：尾块 2048 的 slot 3 写 0
+    for (int j = 0; j < HKV * DH; j++)
+      vctA[((size_t)2048 * HKV * DH + j) * 4 + 3] = 0;
+    float* dq = dup(q);
+    int* dsel = dup(sel);
+    uint16_t *dkc = dup(kc), *dvc = dup(vc);
+    uint16_t* dvct = dup(vctB);  // 同一设备缓冲：先写 A 内容跑 P=3，再写 B 内容
+    const size_t OB = (size_t)4 * HQ * DH;
+    float *oA = dalloc(OB), *oB = dalloc(OB), *oC = dalloc(OB);
+    TCK(hipMemcpy(dvct, vctA.data(), vctA.size() * 2, hipMemcpyHostToDevice));
+    k_qsa_wmma<true, true><<<dim3(3, HKV), 256>>>(dq, dkc, dvc, dvct, oA, 3,
+                                                  DH, HKV, HQ, dsel, base, base,
+                                                  dptab);
+    TCK(hipMemcpy(dvct, vctB.data(), vctB.size() * 2, hipMemcpyHostToDevice));
+    k_qsa_wmma<true, true><<<dim3(4, HKV), 256>>>(dq, dkc, dvc, dvct, oB, 4,
+                                                  DH, HKV, HQ, dsel, base, base,
+                                                  dptab);
+    k_qsa_wmma<true, true><<<dim3(3, HKV), 256>>>(dq, dkc, dvc, dvct, oC, 3,
+                                                  DH, HKV, HQ, dsel, base, base,
+                                                  dptab);
+    char nm[64];
+    auto biteq3 = [&](const char* name, float* a, float* b) {
+      std::vector<float> ha((size_t)3 * HQ * DH), hb((size_t)3 * HQ * DH);
+      TCK(hipMemcpy(ha.data(), a, ha.size() * 4, hipMemcpyDeviceToHost));
+      TCK(hipMemcpy(hb.data(), b, hb.size() * 4, hipMemcpyDeviceToHost));
+      int badrow = -1;
+      for (int r = 0; r < 3 && badrow < 0; r++)
+        if (memcmp(ha.data() + (size_t)r * HQ * DH, hb.data() + (size_t)r * HQ * DH,
+                   (size_t)HQ * DH * 4))
+          badrow = r;
+      printf("%-28s %s%s\n", name, badrow < 0 ? "PASS" : "FAIL",
+             badrow < 0 ? "" : " (first bad row printed)");
+      if (badrow >= 0) {
+        fails++;
+        const float* ra = ha.data() + (size_t)badrow * HQ * DH;
+        const float* rb = hb.data() + (size_t)badrow * HQ * DH;
+        int nd = 0, first = -1, last = -1;
+        uint32_t hdiff[24] = {};  // 每头差异计数（head = idx / 256）
+        for (int i = 0; i < HQ * DH; i++)
+          if (memcmp(ra + i, rb + i, 4)) {
+            nd++;
+            if (first < 0) first = i;
+            last = i;
+            hdiff[i / DH]++;
+          }
+        printf("  row%d ndiff=%d first=%d last=%d per-head:", badrow, nd, first,
+               last);
+        for (int h = 0; h < 24; h++)
+          if (hdiff[h]) printf(" h%d=%u", h, hdiff[h]);
+        printf("\n  A[first]=%a B[first]=%a\n", (double)ra[first],
+               (double)rb[first]);
+      }
+    };
+    biteq3("ri_qsa_wmma_A_vs_B", oA, oB);  // 引擎 γ=2 vs γ=3 复现
+    biteq3("ri_qsa_wmma_C_vs_B", oC, oB);  // 同 vct，仅 P/grid 变
+    biteq3("ri_qsa_wmma_A_vs_C", oA, oC);  // 同 P=3，仅 slot3 变
+    TCK(hipFree(dq)); TCK(hipFree(dsel));
+    TCK(hipFree(dkc)); TCK(hipFree(dvc)); TCK(hipFree(dvct));
+    TCK(hipFree(oA)); TCK(hipFree(oB)); TCK(hipFree(oC));
+    TCK(hipFree(dptab));
+  }
+
   // ---- 2. k_router_topk batched (P blocks, ids/ws rows of 16) ----
   {
     const int P = 3, N = 512, K = 10;
@@ -2391,7 +2880,7 @@ int main() {
         std::vector<std::pair<int, uint32_t>> exp(u.begin(), u.end());
         if (u.find(own) == u.end() || !(u[own] & (0xFu << 12)))
           exp.push_back({own, 0});  // 补登（mask=0）
-        while (exp.size() & 3) exp.push_back({0xFFFF, 0});
+        while (exp.size() & 3) exp.push_back({(uint16_t)(own - 1), 0});
         if ((int)exp.size() > QSA_UCAP || hcnt[g] != (int)exp.size()) {
           merge_bad++;
           continue;
@@ -2910,6 +3399,7 @@ int main() {
   }
 
   // ---- 14. k_gdn_chunk vs per-token k_gdn_step recurrence ----
+  gdn_comparison_selftest();
   {
     hipFuncAttributes attr;
     TCK(hipFuncGetAttributes(&attr, (const void*)k_gdn_inter_strip));
@@ -2960,9 +3450,12 @@ int main() {
         sabs = std::max(sabs, (double)fabs(sr[i] - sc[i]));
       char nm[64];
       snprintf(nm, sizeof nm, "gdn_chunk_P%d_S%d", P, nonzero_s);
+      const auto chunk_cmp = gdn_compare(x, vr, vc, sr, sc, P);
+      const bool chunk_ok = chunk_cmp.within_tolerance();
       printf("%-28s out_abs=%.3e out_rel=%.3e S_abs=%.3e  %s\n", nm, mabs, mrel, sabs,
-             (mabs <= 2e-3 && mrel <= 2e-2 && sabs <= 2e-3) ? "PASS" : "FAIL");
-      if (mabs > 2e-3 || mrel > 2e-2 || sabs > 2e-3) fails++;
+             chunk_ok ? "PASS" : "FAIL");
+      if (!chunk_ok) print_gdn_comparison(nm, "step", chunk_cmp);
+      fails += !chunk_ok;
       // split intra/inter path: same tolerances vs the recurrence, plus a
       // bitwise comparison against k_gdn_chunk (expected identical)
       {
@@ -2986,17 +3479,18 @@ int main() {
         for (size_t i = 0; i < s0.size(); i++)
           sabs2 = std::max(sabs2, (double)fabs(sr[i] - ss[i]));
         bool bitexact = vc == vs && sc == ss;
+        const auto step_cmp = gdn_compare(x, vr, vs, sr, ss, P);
+        const bool ok = bitexact && step_cmp.within_tolerance();
         snprintf(nm, sizeof nm, "gdn_split_P%d_S%d", P, nonzero_s);
         printf("%-28s out_abs=%.3e out_rel=%.3e S_abs=%.3e bitexact=%d  %s\n", nm,
-               mabs2, mrel2, sabs2, (int)bitexact,
-               (mabs2 <= 2e-3 && mrel2 <= 2e-2 && sabs2 <= 2e-3 && bitexact) ? "PASS"
-                                                                            : "FAIL");
-        if (mabs2 > 2e-3 || mrel2 > 2e-2 || sabs2 > 2e-3 || !bitexact) fails++;
+               mabs2, mrel2, sabs2, (int)bitexact, ok ? "PASS" : "FAIL");
+        if (!ok) print_gdn_comparison(nm, "step", step_cmp);
+        fails += !ok;
         TCK(hipFree(dxs));
         TCK(hipFree(dss));
         TCK(hipFree(dws2));
       }
-      // strip inter variant (8 column strips/head): bitwise vs k_gdn_chunk
+      // strip 输出按既有递推误差门槛验收；最终状态仍与 chunk 位同。
       {
         float* dxt = dup(x);
         float* dst = dup(s0);
@@ -3008,15 +3502,21 @@ int main() {
         std::vector<float> vt = dget(dxt, x.size()), st = dget(dst, s0.size());
         bool bitexact = vc == vt && sc == st;
         snprintf(nm, sizeof nm, "gdn_strip_P%d_S%d", P, nonzero_s);
-        printf("%-28s bitexact=%d  %s\n", nm, (int)bitexact,
-               bitexact ? "PASS" : "FAIL");
-        if (!bitexact) fails++;
+        const auto step_cmp = gdn_compare(x, vr, vt, sr, st, P);
+        const auto chunk_cmp = gdn_compare(x, vc, vt, sc, st, P);
+        print_gdn_comparison(nm, "step", step_cmp);
+        print_gdn_comparison(nm, "chunk", chunk_cmp);
+        const bool state_exact = memcmp(sc.data(), st.data(), sc.size() * sizeof(float)) == 0;
+        const bool ok = state_exact && step_cmp.within_tolerance() && chunk_cmp.within_tolerance();
+        printf("%-28s bitexact=%d state_exact=%d %s\n", nm, (int)bitexact,
+               (int)state_exact, ok ? "PASS" : "FAIL");
+        if (!ok) fails++;
         TCK(hipFree(dxt));
         TCK(hipFree(dst));
         TCK(hipFree(dws3));
       }
-      // Exercise window boundaries, partial chunks, nonzero state, and the
-      // two independent stream/wave switches with byte-exact comparisons.
+      // 覆盖窗口边界、尾块、非零状态及两种 intra 路径；
+      // 输出按递推数值契约验收，状态保留 byte-exact 交接契约。
       for (bool wave : {false, true}) {
         float* dxw = dup(x);
         float* dsw = dup(s0);
@@ -3036,8 +3536,15 @@ int main() {
         bool exact = memcmp(vc.data(), vw.data(), vc.size() * sizeof(float)) == 0 &&
                      memcmp(sc.data(), sw.data(), sc.size() * sizeof(float)) == 0;
         snprintf(nm, sizeof nm, "gdn_window_P%d_S%d_W%d", P, nonzero_s, (int)wave);
-        printf("%-28s bitexact=%d %s\n", nm, (int)exact, exact ? "PASS" : "FAIL");
-        if (!exact) fails++;
+        const auto step_cmp = gdn_compare(x, vr, vw, sr, sw, P);
+        const auto chunk_cmp = gdn_compare(x, vc, vw, sc, sw, P);
+        print_gdn_comparison(nm, "step", step_cmp);
+        print_gdn_comparison(nm, "chunk", chunk_cmp);
+        const bool state_exact = memcmp(sc.data(), sw.data(), sc.size() * sizeof(float)) == 0;
+        const bool ok = state_exact && step_cmp.within_tolerance() && chunk_cmp.within_tolerance();
+        printf("%-28s bitexact=%d state_exact=%d %s\n", nm, (int)exact,
+               (int)state_exact, ok ? "PASS" : "FAIL");
+        if (!ok) fails++;
         TCK(hipFree(dxw)); TCK(hipFree(dsw)); TCK(hipFree(ws));
       }
       // ut5 blocked solve: off-diagonal tiles reassociate in fp32, so compare
@@ -3066,9 +3573,12 @@ int main() {
         for (size_t i = 0; i < s0.size(); i++)
           sabs3 = std::max(sabs3, (double)fabs(sc[i] - su[i]));
         snprintf(nm, sizeof nm, "gdn_ut5_P%d_S%d", P, nonzero_s);
+        const auto cmp = gdn_compare(x, vc, vu, sc, su, P);
+        const bool ok = cmp.within_tolerance();
         printf("%-28s out_abs=%.3e out_rel=%.3e S_abs=%.3e  %s\n", nm, mabs3, mrel3,
-               sabs3, (mabs3 <= 2e-3 && mrel3 <= 2e-2 && sabs3 <= 2e-3) ? "PASS" : "FAIL");
-        if (mabs3 > 2e-3 || mrel3 > 2e-2 || sabs3 > 2e-3) fails++;
+               sabs3, ok ? "PASS" : "FAIL");
+        if (!ok) print_gdn_comparison(nm, "chunk", cmp);
+        fails += !ok;
         TCK(hipFree(dxu)); TCK(hipFree(dsu)); TCK(hipFree(ws));
       }
       TCK(hipFree(dxr));
@@ -3078,6 +3588,84 @@ int main() {
       TCK(hipFree(dxc));
       TCK(hipFree(dsc));
       TCK(hipFree(dws));
+    }
+  }
+
+  // 生产 fused GDN：归一化 Q/K、独立随机序列，直接对逐 token 递推验收。
+  {
+    std::mt19937 fused_rng(0x6f757365);
+    auto random = [&] { return std::uniform_real_distribution<float>(-1.f, 1.f)(fused_rng); };
+    for (int P : {1, 63, 64, 65, 255, 256, 257, 513}) {
+      for (int nonzero_s : {0, 1}) {
+        const int QKV = 10240, HV = 48, DK = 128;
+        std::vector<float> x((size_t)P * QKV), g((size_t)P * HV),
+            beta((size_t)P * HV), s0(HV * DK * DK);
+        for (auto& v : x) v = random();
+        for (auto& v : g) v = -0.001f - 0.3f * fabsf(random());
+        for (auto& v : beta) v = 0.05f + 0.9f * fabsf(random());
+        for (auto& v : s0) v = nonzero_s ? random() * 0.1f : 0.f;
+        float* dxn = dup(x);
+        k_l2norm_qk_b<<<dim3(16, P), 128>>>(dxn, DK, 1.f / sqrtf((float)DK), QKV, 16);
+        x = dget(dxn, x.size());
+        TCK(hipFree(dxn));
+        float* dgr = dup(g);
+        float* dbr = dup(beta);
+        float* dxr = dup(x);
+        float* dsr = dup(s0);
+        for (int t = 0; t < P; t++) {
+          float* row = dxr + (size_t)t * QKV;
+          k_gdn_step<<<HV, 512>>>(row, row + 2048, row + 4096,
+                                  dgr + (size_t)t * HV, dbr + (size_t)t * HV,
+                                  dsr, row + 4096, DK, DK, HV, 16);
+        }
+        const auto vr = dget(dxr, x.size()), sr = dget(dsr, s0.size());
+        auto run_fused = [&](const char* mode, int cut) {
+          float* dx = dup(x);
+          float* ds = dup(s0);
+          if (cut > 0 && cut < P) {
+            k_gdn_fused<<<HV, 1024>>>(dx, dgr, dbr, ds, dx, cut, QKV);
+            float* tail = dx + (size_t)cut * QKV;
+            k_gdn_fused<<<HV, 1024>>>(tail, dgr + (size_t)cut * HV,
+                                      dbr + (size_t)cut * HV, ds, tail, P - cut, QKV);
+          } else {
+            k_gdn_fused<<<HV, 1024>>>(dx, dgr, dbr, ds, dx, P, QKV);
+          }
+          auto v = dget(dx, x.size()), s = dget(ds, s0.size());
+          const auto cmp = gdn_compare(x, vr, v, sr, s, P);
+          char name[80];
+          snprintf(name, sizeof name, "gdn_fused_P%d_S%d_%s", P, nonzero_s, mode);
+          print_gdn_comparison(name, "step", cmp);
+          const bool ok = cmp.within_tolerance();
+          printf("%-28s %s\n", name, ok ? "PASS" : "FAIL");
+          fails += !ok;
+          TCK(hipFree(dx));
+          TCK(hipFree(ds));
+          return std::make_pair(std::move(v), std::move(s));
+        };
+        const auto full = run_fused("full", 0);
+        const auto repeat = run_fused("repeat", 0);
+        const bool deterministic =
+            memcmp(full.first.data(), repeat.first.data(), x.size() * sizeof(float)) == 0 &&
+            memcmp(full.second.data(), repeat.second.data(), s0.size() * sizeof(float)) == 0;
+        printf("gdn_fused_repeat_P%d_S%d bitexact=%d %s\n", P, nonzero_s,
+               (int)deterministic, deterministic ? "PASS" : "FAIL");
+        fails += !deterministic;
+        if (P > 64) {
+          const auto aligned = run_fused("cut64", 64);
+          const bool exact =
+              memcmp(full.first.data(), aligned.first.data(), x.size() * sizeof(float)) == 0 &&
+              memcmp(full.second.data(), aligned.second.data(), s0.size() * sizeof(float)) == 0;
+          printf("gdn_fused_cut64_P%d_S%d bitexact=%d %s\n", P, nonzero_s,
+                 (int)exact, exact ? "PASS" : "FAIL");
+          fails += !exact;
+        }
+        // 非 64 对齐会重启 chunk 网格，只要求满足同一数值契约。
+        if (P > 1) run_fused("cut_partial", P > 63 ? 63 : P / 2);
+        TCK(hipFree(dgr));
+        TCK(hipFree(dbr));
+        TCK(hipFree(dxr));
+        TCK(hipFree(dsr));
+      }
     }
   }
 

@@ -492,7 +492,7 @@ int tray_run(http::Server& srv, const TrayHooks& hooks) {
     WNDCLASSW wc{};
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = hi;
-    wc.lpszClassName = L"gfx1151_qwenox_api";
+    wc.lpszClassName = L"Qwenox_api";
     RegisterClassW(&wc);
     // 普通的隐藏顶层窗口（不 ShowWindow）：消息窗口收不到 TaskbarCreated 广播
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Qwenox", WS_OVERLAPPED, 0, 0, 0, 0,

@@ -15,7 +15,8 @@
 | `KV_POOL_TOKENS` | 0 | 共享 KV 页池大小，取 `max(KV_POOL_TOKENS, MAX_CONTEXT)`；默认即一条 256K |
 
 引擎读 `QWENOX_PARALLEL`，API 启动时从引擎 `INFO` 的 `kv_slots` 字段得知路数并开同样
-多的引擎连接。每多一路约多占 0.12 GiB 显存（GDN 状态 113 MB 加少量 MTP 流状态）。
+多的引擎连接。每多一路约多占 0.27 GiB 显存（Windows 实测：512K 页池下 2 路 → 8 路多 1.6 GiB，v2 与
+UD-IQ4_XS 相同），主要是 GDN 状态（113 MB）、会合 verify 的行窗口备份（48.4 MB）和 MTP 流状态。
 MTP 层的 KV/indexer keys 是共享页池里的一层（B0），和主干 KV 一样按页取用，不再每路按
 MAX_CONTEXT 预分配（旧版每路多 0.5 GiB（BF16）/ 1 GiB（FP32）；PARALLEL=4 实测省 1.63 GiB）。
 rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`tools/b0_verify.sh` 验证）。
@@ -26,13 +27,33 @@ rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`
   默认的 unified KV。例如 256K 池可以是 4 条 64K，也可以是 1 条 200K 加 3 条短的。
 - **调度**：每个连接一个读线程（`PING/INFO/X` 随时响应），每个 `GEN` 一个工作线程；
   FIFO 票据锁拥有 GPU，持有者在让出点（spec 轮开头、prefill 分块边界、串行 decode
-  每个 token）发现有人排队就交出。每条序列算出的结果与它单独运行逐位一致。
+  每个 token）发现有人排队就交出。
+- **与单跑是否一致**：v2 hgn 上，每条序列的 greedy 输出与它单独运行逐位一致；带 seed
+  的采样请求（API 显式传 `seed`，引擎协议 `SEEDED`）同样一致。没给 seed 的采样请求本来就
+  随机，不保证。GGUF 上 greedy 在近似平局处偶尔会不同（Windows UD-IQ4_XS 实测：10 个请求里
+  有 1 个，在第 27 个 token 上“are:”与“are G…”的差别，大约一半的并发运行出现）：并发时
+  MTP 投机的 γ 按同时在跑的人数选（OccGamma），而 GGUF 路径的输出对 γ 不严格不变。需要
+  严格一致时设 `QWENOX_OCC_FORCE=4`，greedy 的 γ 在任何并发下都固定为 4（吞吐会低一些）。
+- **会合 verify 的行窗口备份**：多条序列的 MTP verify 合成一批跑完后，GPU 会先交出去，
+  各序列再依次回来提交 / 回滚，期间别的请求（prefill、ngram verify、单段 verify）可能已经
+  改写了共享缓冲里它们那几行。引擎在交出前按槽备份这些行，回来时先拷回（每槽 48.4 MB，
+  `QWENOX_VR_RESTORE=0` 可关，关掉后并发输出会与单跑分叉）。`QWENOX_VR_CHECK=1` 调试用：
+  两边算哈希，被改写时日志打 `[vr-check] ... CLOBBERED`。
 - **并发时的 prefill 分段**：PARALLEL>1 时 prompt 按 min(`CONC_PREFILL_CHUNK`, 单路分段) 分段
   （默认 8192，引擎变量 `QWENOX_CONC_PREFILL_CHUNK`；单路分段 = `PREFILL_CHUNK`，Linux 默认 16384），
   只缩不放。`PREFILL_CHUNK` 管工作区显存和单条 prompt 的 PP，`CONC_PREFILL_CHUNK` 管并发响应：
   分段越小，长 prompt prefill 期间别的会话卡得越短（32K prompt 实测最长卡顿 16384 时 830 ms、
   8192 时 624 ms），代价是这条 prompt 的首 token 约晚 8%。它在启动时一次定死，只有一个请求时也按它分段。
   分段不逐位一致，对 BF16 真值的 KLD 相同（`tools/d1a_kld.sh`）。0 = 并发时也用单路分段。
+- **多条长 prompt 同时 prefill**（10-13）：prefill 只在两种情况下把 GPU 让出来：
+  - 有 decode/verify 小轮次在等：层间每 300 ms 出让一次，每次给它一轮；
+  - 有另一条剩余更少的 prompt 在等：在分段边界让出。剩余一样多时先来的先跑完。
+
+  所以两条同长的 64K prompt 不再逐段轮流，而是一条跑完再跑另一条：总耗时约等于两条单跑之和，
+  先到的那条首 token 约提前一半。短 prompt 插进长 prompt 时，最多等一个分段。
+  回退开关：`QWENOX_CONC_LEND_LIGHT_ONLY=0` 恢复"有人排队就出让"，`QWENOX_PREFILL_SRPT=0`
+  恢复逐段轮流。同一版修了 PLE 下一段预取跨槽误用的问题：两路同时起步时，分段起点相同，
+  先进来的那路会读到另一路的 PLE 行。验证脚本是 `tools/prefill_sched_win.sh`（`SMOKE=1` 只跑约 2 分钟冒烟）。
 - **超出路数**：第 N+1 个请求在引擎（和 API）里排队，直到有槽位空出；排队中可以取消。
 - **槽位复用**：新请求优先选 hist 是其严格前缀的空闲槽位（多轮对话免 prefill），其次
   空槽，再次连接已断开的最久未用槽，最后最久未用槽。
@@ -80,3 +101,17 @@ bash tools/conc_verify.sh
 
 可选：`OLD_BIN=build/qwenox.old` 额外对拍旧二进制的单路结果（注意上面的确定性修复会让
 旧/新在长输出上合法地不同）；`STAGES="ovf"` 只跑某几段；`CONC_ENV="..."` 附加引擎环境。
+
+Windows（Git Bash）：
+
+```bash
+bash build_win.sh engine
+bash tools/conc_fix_regress_win.sh     # 约 70 分钟，结尾 CONC_FIX PASS/FAIL
+bash tools/conc_diverge_win.sh         # 排查用：单跑参考 + 若干并发配置，只比 token，打表
+```
+
+`conc_fix_regress_win.sh` 跑 v2 4 路 / 8 路多次、带 seed 的采样、GGUF 4 路 / 8 路、
+`d2_s2_ids.sh`、vseg 自检和 API 吞吐（`QWENOX_VR_RESTORE` 开 / 关对照）。GGUF 按上面“与单跑
+是否一致”一节，用 `QWENOX_OCC_FORCE=4` 判定，按人数选 γ 的那次只报告。
+`conc_diverge_win.sh` 的用法见文件头（`CONFIGS="base|QWENOX_OCC_FORCE=4"`、`CONC_SEEDED=1`、
+GGUF 用 `MODEL_ARGS=<gguf> GGUF_MTP=<sidecar>`）。

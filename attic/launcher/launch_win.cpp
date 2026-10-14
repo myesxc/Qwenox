@@ -86,7 +86,7 @@ std::wstring to_w(const std::string& s) {
 }
 
 int msgbox(const std::string& text, UINT flags) {
-    return MessageBoxW(nullptr, to_w(text).c_str(), L"gfx1151-engine",
+    return MessageBoxW(nullptr, to_w(text).c_str(), L"Qwenox",
                        flags | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
@@ -622,7 +622,7 @@ void tray_update_tip() {
     // 性能行照旧追加在第二行。
     std::wstring tip = g_state == kReady
         ? TR(L"引擎就绪", L"Engine ready")
-        : L"gfx1151-engine · " + status_text();
+        : L"Qwenox · " + status_text();
     if (g_state == kReady) {
         const std::wstring perf = perf_tip();
         if (!perf.empty()) tip += L"\n" + perf;
@@ -666,7 +666,7 @@ void tray_add() {
     g_nid.hIcon = small_icon ? small_icon
                              : LoadIconA(nullptr, IDI_APPLICATION);  // 未定义 UNICODE：IDI_* 是窄串
     g_nid.hBalloonIcon = big_icon;
-    const std::wstring tip = L"gfx1151-engine · " + status_text();
+    const std::wstring tip = L"Qwenox · " + status_text();
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     // 开机自启时任务栏可能还没起来：失败就等 TaskbarCreated 再加
     if (Shell_NotifyIconW(NIM_ADD, &g_nid)) {
@@ -829,10 +829,10 @@ int tray_main() {
     WNDCLASSW wc{};
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = hi;
-    wc.lpszClassName = L"gfx1151_start_win";
+    wc.lpszClassName = L"Qwenox_start_win";
     RegisterClassW(&wc);
     // 普通的隐藏顶层窗口（不 ShowWindow）：消息窗口收不到 TaskbarCreated 广播
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"gfx1151-engine", WS_OVERLAPPED, 0, 0, 0, 0,
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Qwenox", WS_OVERLAPPED, 0, 0, 0, 0,
                              nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) fail("无法创建托盘窗口，错误码 " + std::to_string(GetLastError()));
     g_wm_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
@@ -904,7 +904,7 @@ int main(int argc, char** argv) {
 
     // 防多开（--check 不受限）。句柄不关，进程退出时系统回收。
     if (!check_only) {
-        CreateMutexW(nullptr, FALSE, L"Local\\gfx1151-engine-start_win");
+        CreateMutexW(nullptr, FALSE, L"Local\\Qwenox-start_win");
         if (GetLastError() == ERROR_ALREADY_EXISTS)
             fail("start_win.exe 已经在运行了（看任务栏右下角的托盘图标，"
                  "可能藏在 ^ 展开区里）。");

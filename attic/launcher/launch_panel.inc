@@ -404,11 +404,8 @@ void check_weight(CheckLines& c, const char* label, const std::string& path,
     }
     unsigned long long size = 0;
     file_size_of(path, &size);
-    if (size < 100ull * 1024 * 1024) {
-        check_line(c, kLvFail, std::string(label) + TR("：文件异常小（", ": suspiciously small file (") +
-                                   std::to_string(size) + TR(" B）", " B): ") + path);
-        return;
-    }
+    // 不按大小判定：合法 sidecar 可以很小（转换脚本产出的 MTP 仅 ~93 MB），
+    // 真坏的文件引擎加载时会报错
     // magic 嗅探：.hgn → HGN1（src/hgn.h），.gguf → GGUF；其它扩展名跳过
     const size_t dot = path.find_last_of('.');
     const std::string ext =
@@ -1572,7 +1569,7 @@ PanelResult panel_run(bool allow_start) {
         wc.cbSize = sizeof wc;
         wc.lpfnWndProc = panel_proc;
         wc.hInstance = hi;
-        wc.lpszClassName = L"gfx1151_setup_panel";
+        wc.lpszClassName = L"Qwenox_setup_panel";
         wc.hbrBackground = g_panel_bg;
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
         // 窗口图标（任务栏按钮用）：内嵌 ICO，否则任务栏是空白默认图标
@@ -1591,8 +1588,8 @@ PanelResult panel_run(bool allow_start) {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     const int wx = work.left + (work.right - work.left - win_w) / 2;
     const int wy = work.top + (work.bottom - work.top - win_h) / 2;
-    HWND h = CreateWindowExW(0, L"gfx1151_setup_panel",
-                             TR(L"gfx1151-engine 启动设置", L"gfx1151-engine Startup Setup"),
+    HWND h = CreateWindowExW(0, L"Qwenox_setup_panel",
+                             TR(L"Qwenox 启动设置", L"Qwenox Startup Setup"),
                              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, wx, wy, win_w, win_h,
                              nullptr, nullptr, hi, nullptr);
     if (!h) {

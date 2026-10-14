@@ -18,7 +18,7 @@ std::string exe_dir() {
 }
 
 int fail(const std::string& msg) {
-    MessageBoxA(nullptr, msg.c_str(), "gfx1151-engine",
+    MessageBoxA(nullptr, msg.c_str(), "Qwenox",
                 MB_ICONERROR | MB_OK | MB_SETFOREGROUND | MB_TOPMOST);
     return 1;
 }

@@ -28,7 +28,10 @@ namespace {
 
 std::mutex g_mtx;
 Status g_st;
+#ifdef _WIN32  // 仅 Windows 监管线程/stop() 使用；Linux 下未用会触发 -Werror=unused-variable
 bool g_stopping = false;  // stop() 主动停止：监管线程把退出记为 stopped 而非 exited
+#endif
+
 std::function<void()> g_lifecycle;  // set_lifecycle_listener()，g_mtx 保护
 
 // 锁外调用监听者：回调会去拿 API 自己的锁，持着 g_mtx 调会埋下反向锁序。
@@ -231,13 +234,26 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     }
     // 与 launch_win.cpp 相同的取值与默认（env > conf > 内置）
     const std::string model_dir = svcconf::cfg(conf, "MODEL_DIR", "models");
-    const std::string model_file = svcconf::cfg(conf, "MODEL_FILE", model_dir + "\\heretic.hgn");
-    const std::string ngram_file = svcconf::cfg(conf, "NGRAM_FILE", model_file);
+    // weights=gguf（设置页/网页选 GGUF）：引擎直接吃 GGUF 首分片（纯 GGUF 启动，
+    // 引擎侧 gguf_base_setup），MTP sidecar 走 QWENOX_GGUF_MTP（空 = 不投机），
+    // 视觉塔 GGUF_VISION_FILE（mmproj *.gguf 或 *-vision.hgn 均可）。
+    const auto wv = conf.find(kWeightsVerKey);
+    const bool gguf = wv != conf.end() && wv->second == "gguf";
+    const std::string model_file =
+        gguf ? svcconf::cfg(conf, "GGUF_FILE", "")
+             : svcconf::cfg(conf, "MODEL_FILE", model_dir + "\\heretic.hgn");
+    const std::string ngram_file = gguf ? model_file : svcconf::cfg(conf, "NGRAM_FILE", model_file);
     const std::string mtp_file =
-        svcconf::cfg_optional(conf, "MTP_FILE", model_dir + "\\heretic-mtp.hgn");
+        gguf ? svcconf::cfg_optional(conf, "GGUF_MTP_FILE", "")
+             : svcconf::cfg_optional(conf, "MTP_FILE", model_dir + "\\heretic-mtp.hgn");
     const std::string vision_file =
-        svcconf::cfg_optional(conf, "VISION_FILE", model_dir + "\\heretic-vision.hgn");
-    std::string overlay_file = svcconf::cfg_optional(conf, "OVERLAY_FILE", "");
+        gguf ? svcconf::cfg_optional(conf, "GGUF_VISION_FILE", "")
+             : svcconf::cfg_optional(conf, "VISION_FILE", model_dir + "\\heretic-vision.hgn");
+    std::string overlay_file = gguf ? "" : svcconf::cfg_optional(conf, "OVERLAY_FILE", "");
+    if (gguf && model_file.empty()) {
+        *err = "weights=gguf but GGUF_FILE is not set (first shard *-00001-of-0000N.gguf)";
+        return false;
+    }
     const std::string engine_host = svcconf::cfg(conf, "ENGINE_HOST", engine_net::kDefaultHost);
     long engine_port = 8730, max_context = 262144, mtp_gamma = 0, kvsnap_max_gb = 20,
          rckpt_max = 8, kv_paged = 1, kv_pool_tokens = 0, parallel = 1, max_images = 8,
@@ -319,11 +335,21 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     SetEnvironmentVariableA("QWENOX_ROPE_ATTN_SCALE", rope_attn_s.c_str());
     if (prefill_chunk)
         SetEnvironmentVariableA("QWENOX_PREFILL_CHUNK", std::to_string(prefill_chunk).c_str());
+    // GGUF：MTP sidecar 不是位置参数而是 QWENOX_GGUF_MTP。conf 里没有
+    // GGUF_MTP_FILE 键 = 不设（引擎在分片目录自动找唯一的 mtp-*.gguf）；键显式
+    // 置空 = "none"（引擎不投机；Windows 环境变量无法可靠地传空串）。
+    const bool mtp_key = getenv("GGUF_MTP_FILE") || conf.count("GGUF_MTP_FILE");
+    SetEnvironmentVariableA("QWENOX_GGUF_MTP",
+                            !gguf || !mtp_key ? nullptr
+                            : mtp_file.empty() ? "none"
+                                               : mtp_file.c_str());
+    for (const char* k : {"QWENOX_GGUF", "QWENOX_GGUF_DENSE", "QWENOX_GGUF_PLE", "QWENOX_GGUF_EXPERTS"})
+        SetEnvironmentVariableA(k, nullptr);
 
     std::vector<std::string> args = {model_file};
     if (!overlay_file.empty()) args.push_back(overlay_file);
     if (!same_file(ngram_file, model_file)) args.push_back(ngram_file);
-    if (!mtp_file.empty()) args.push_back(mtp_file);
+    if (!gguf && !mtp_file.empty()) args.push_back(mtp_file);
     args.insert(args.end(),
                 {"--serve", "--host", engine_host, "--port", std::to_string(engine_port),
                  "--maxctx", std::to_string(max_context)});

@@ -14,7 +14,7 @@ previous turn's prompt + output, so they exercise live-state continuation
 (n_cached > 0) while other sequences interleave on the GPU. Each flow has a
 unique prefix, so no request can hit another's cache.
 """
-import argparse, json, socket, sys, threading, time
+import argparse, json, os, socket, sys, threading, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qwentok import Tokenizer
@@ -74,13 +74,16 @@ class Conn:
 def flows(tk):
     o8, o32, natural, code, numbered = prompts(tk)
     tag = lambda s: tk.encode(f'[conc {s}]\n')
+    # CONC_SEEDED=1: the sampled flows send SEEDED (client-chosen seed ->
+    # reproducible under concurrency, OccGamma uses the fixed B = nslots)
+    smp = SAMPLE + (' SEEDED' if os.environ.get('CONC_SEEDED') == '1' else '')
     F = [
         [('nat-d0', tag('nat-d0') + natural, 96, 0, '')],
         [('code-d3', tag('code-d3') + code, 96, 3, '')],
         [('num-d4', tag('num-d4') + numbered, 128, 4, '')],
         [('nat-d1', tag('nat-d1') + natural, 96, 1, '')],
-        [('S-code-d4', tag('S-code-d4') + code, 64, 4, SAMPLE)],
-        [('S-nat-d1', tag('S-nat-d1') + natural, 64, 1, SAMPLE)],
+        [('S-code-d4', tag('S-code-d4') + code, 64, 4, smp)],
+        [('S-nat-d1', tag('S-nat-d1') + natural, 64, 1, smp)],
         [('L3k-d0', tag('L3k-d0') + o8[:3000], 64, 0, '')],
     ]
     head = tk.encode('<|im_start|>user\n')

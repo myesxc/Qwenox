@@ -39,9 +39,10 @@ __global__ void k_gdn_conv_b(const float* __restrict__ x, const float* __restric
 
 // --- write back conv state: convst[j] = last-3 inputs after P tokens.
 // Per-channel independent; old values are read into registers before writing.
-__global__ void k_convst_update(float* __restrict__ convst, const float* __restrict__ x,
-                                int P, int qkv) {
-  int ch = blockIdx.x * blockDim.x + threadIdx.x;
+__device__ __forceinline__ void convst_update_body(const int ch,
+                                                   float* __restrict__ convst,
+                                                   const float* __restrict__ x,
+                                                   int P, int qkv) {
   if (ch >= qkv) return;
   float o1 = convst[qkv + ch], o2 = convst[2 * qkv + ch];
   float n2 = x[(size_t)(P - 1) * qkv + ch];
@@ -51,6 +52,10 @@ __global__ void k_convst_update(float* __restrict__ convst, const float* __restr
   convst[ch] = n0;
   convst[qkv + ch] = n1;
   convst[2 * qkv + ch] = n2;
+}
+__global__ void k_convst_update(float* __restrict__ convst, const float* __restrict__ x,
+                                int P, int qkv) {
+  convst_update_body(blockIdx.x * blockDim.x + threadIdx.x, convst, x, P, qkv);
 }
 
 // --- batched GDN q/k L2 norm + q scale: grid (hk, P) over [P, qkvstride] rows.
@@ -96,14 +101,15 @@ __global__ void k_l2norm_qk_b(float* __restrict__ qkv, int dk, float qscale,
 // fused into the first add (the unfused kernel squares into LDS first).
 // Saves the l2norm read+write of the q/k columns (~268 MB/layer at P=8192).
 // grid (ceil(qkv/1024), P), 256 threads.
-__global__ void __launch_bounds__(256)
-    k_gdn_conv_l2n_b(const float* __restrict__ x, const float* __restrict__ cw,
-                     const float* __restrict__ convst, float* __restrict__ out,
-                     int P, int qkv, int nqk, float qscale) {
+// t = row within the window x/out/convst describe (x row 0 = first row).
+__device__ __forceinline__ void gdn_conv_l2n_body(
+    const int t, const float* __restrict__ x, const float* __restrict__ cw,
+    const float* __restrict__ convst, float* __restrict__ out, int qkv, int nqk,
+    float qscale) {
   const int lane = threadIdx.x & 31;
   const int slice = blockIdx.x * 8 + (threadIdx.x >> 5);
   if (slice * 128 >= qkv) return;  // wave-uniform
-  const int t = blockIdx.y, ch = slice * 128 + lane * 4;
+  const int ch = slice * 128 + lane * 4;
   const int64_t i = (int64_t)t * qkv + ch;
   float4 xv = *(const float4*)(x + i);
   float4 a;
@@ -157,7 +163,75 @@ __global__ void __launch_bounds__(256)
   }
   *(float4*)(out + i) = o;
 }
+__global__ void __launch_bounds__(256)
+    k_gdn_conv_l2n_b(const float* __restrict__ x, const float* __restrict__ cw,
+                     const float* __restrict__ convst, float* __restrict__ out,
+                     int P, int qkv, int nqk, float qscale) {
+  gdn_conv_l2n_body(blockIdx.y, x, cw, convst, out, qkv, nqk, qscale);
+}
 // [gdn-convl2-end]
+
+// ---- Batched multi-segment verify (prefill_chunk_vseg): the GDN state ops
+// of every segment in ONE launch per kernel (blockIdx.y / grid row picks the
+// segment) instead of one 48-block launch per segment. Each block runs the
+// same __forceinline__ body as the per-segment kernel on that segment's row
+// window and slot state, so every output bit equals the per-segment launch.
+// Pointers are this layer's (the host adds the gi offsets).
+struct GdnVSeg {
+  float* convst;   // slot conv state (layer gi)
+  float* S;        // slot recurrent state (layer gi)
+  float* csnap;    // conv snapshot base for row 0 of the segment (layer gi)
+  int r0, P;       // batch rows [r0, r0+P)
+};
+struct GdnVSegs {
+  GdnVSeg s[8];
+  int n;
+  signed char rowseg[64];  // batch row -> segment
+};
+// Device int scalars set from kernel arguments, in stream order: replaces
+// per-segment hipMemcpyAsync from pageable host ints (on Windows each such
+// copy round-trips through the host and leaves the GPU idle).
+struct I32Set {
+  int* p[16];
+  int v[16];
+  int n;
+};
+__global__ void k_set_i32(I32Set s) {
+  if ((int)threadIdx.x < s.n) *s.p[threadIdx.x] = s.v[threadIdx.x];
+}
+// grid (10, R), 256 threads: conv+silu+l2norm; history from the row's own
+// segment rows, else that segment's slot conv state.
+__global__ void __launch_bounds__(256)
+    k_gdn_conv_l2n_vseg(const float* __restrict__ x, const float* __restrict__ cw,
+                        float* __restrict__ out, GdnVSegs sg, int qkv, int nqk,
+                        float qscale) {
+  const GdnVSeg& g = sg.s[sg.rowseg[blockIdx.y]];
+  gdn_conv_l2n_body((int)blockIdx.y - g.r0, x + (size_t)g.r0 * qkv, cw, g.convst,
+                    out + (size_t)g.r0 * qkv, qkv, nqk, qscale);
+}
+// grid R, 512 threads: per-row conv-state snapshot rows.
+__global__ void k_convst_snap_vseg(const float* __restrict__ qkvb, GdnVSegs sg,
+                                   int qkv, size_t snaptstride) {
+  const GdnVSeg& g = sg.s[sg.rowseg[blockIdx.x]];
+  convst_snap_body((int)blockIdx.x - g.r0, qkvb + (size_t)g.r0 * qkv, g.convst,
+                   g.csnap, qkv, snaptstride);
+}
+// grid (ceil(qkv/256), nseg), 256 threads.
+__global__ void k_convst_update_vseg(const float* __restrict__ x, GdnVSegs sg,
+                                     int qkv) {
+  const GdnVSeg& g = sg.s[blockIdx.y];
+  convst_update_body(blockIdx.x * blockDim.x + threadIdx.x, g.convst,
+                     x + (size_t)g.r0 * qkv, g.P, qkv);
+}
+// grid (48, nseg), 512 threads; output in place over each segment's v rows,
+// slot S read-only (spec verify: k_gdn_commit installs it after acceptance).
+__global__ void k_gdn_verify_vseg(float* qkv, const float* g48, const float* b48,
+                                  GdnVSegs sg, int stride) {
+  const GdnVSeg& g = sg.s[blockIdx.y];
+  float* q = qkv + (size_t)g.r0 * stride;
+  gdn_verify_body<true, false>(blockIdx.x, q, g48 + (size_t)g.r0 * 48,
+                               b48 + (size_t)g.r0 * 48, g.S, q, g.P, stride);
+}
 
 // --- GDN chunked prefill (torch_chunk_gated_delta_rule equivalent), fp32.
 // One block (256 threads) per v-head; chunks of 64 tokens serially.

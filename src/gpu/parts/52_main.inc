@@ -12,11 +12,31 @@ static void gguf_base_setup(const std::string& base) {
 #else
   setenv("QWENOX_GGUF", base.c_str(), 1);
   setenv("QWENOX_GGUF_DENSE", "1", 1);
-  if (!getenv("QWENOX_GGUF_MTP")) {
-    const size_t sl = base.find_last_of('/');
+#endif
+  // QWENOX_GGUF_MTP=none|0: no MTP sidecar and no auto-detect (the Windows
+  // launcher uses this: an empty variable cannot be passed reliably there).
+  if (const char* m = getenv("QWENOX_GGUF_MTP"); m && (!strcmp(m, "none") || !strcmp(m, "0"))) {
+#ifdef _WIN32
+    _putenv_s("QWENOX_GGUF_MTP", "");  // CRT: an empty value removes the variable
+#else
+    unsetenv("QWENOX_GGUF_MTP");
+#endif
+  } else if (!getenv("QWENOX_GGUF_MTP")) {
+    // default: the single mtp-*.gguf next to the shards
+    const size_t sl = base.find_last_of("/\\");
     const std::string dir = sl == std::string::npos ? "." : base.substr(0, sl);
     std::string hit;
     int n = 0;
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\mtp-*.gguf").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+      do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) hit = dir + "/" + fd.cFileName, n++;
+      } while (FindNextFileA(h, &fd));
+      FindClose(h);
+    }
+#else
     if (DIR* d = opendir(dir.c_str())) {
       while (dirent* e = readdir(d)) {
         const std::string nm = e->d_name;
@@ -24,11 +44,18 @@ static void gguf_base_setup(const std::string& base) {
       }
       closedir(d);
     }
-    if (n == 1) setenv("QWENOX_GGUF_MTP", hit.c_str(), 1);
-    else fprintf(stderr, "gguf: %s MTP sidecar (mtp-*.gguf) in %s; set QWENOX_GGUF_MTP\n",
-                 n ? "several" : "no", dir.c_str());
-  }
 #endif
+    if (n == 1) {
+#ifdef _WIN32
+      _putenv_s("QWENOX_GGUF_MTP", hit.c_str());
+#else
+      setenv("QWENOX_GGUF_MTP", hit.c_str(), 1);
+#endif
+    } else {
+      fprintf(stderr, "gguf: %s MTP sidecar (mtp-*.gguf) in %s; set QWENOX_GGUF_MTP\n",
+              n ? "several" : "no", dir.c_str());
+    }
+  }
   fprintf(stderr, "gguf: pure GGUF start from %s (MTP %s)\n", base.c_str(),
           getenv("QWENOX_GGUF_MTP") && *getenv("QWENOX_GGUF_MTP") ? getenv("QWENOX_GGUF_MTP") : "none");
 }
@@ -429,7 +456,8 @@ int main(int argc, char** argv) {
     kvsnap::g_vision_file = vision_tower;
     return serve::run(m, engine_host, port);
   }
-  if (!kld_mode && tokens.size() < (ppl ? 2u : 1u)) {
+  const char* vseg_selftest_spec = getenv("QWENOX_VSEG_SELFTEST");
+  if (!kld_mode && !vseg_selftest_spec && tokens.size() < (ppl ? 2u : 1u)) {
     fprintf(stderr, ppl ? "--ppl needs at least two tokens\n" : "need --tokens\n");
     return 2;
   }
@@ -471,6 +499,9 @@ int main(int argc, char** argv) {
   gguf_dense_release(ckpt);
   m.ple_on = ple_on;
   m.build_graphs();
+  if (getenv("QWENOX_DEQ_BENCH")) return m.deq_bench();
+  if (vseg_selftest_spec)  // D2-S1c: multi-segment verify selftest owns the run
+    return m.vseg_selftest(vseg_selftest_spec) ? 0 : 1;
   if (mtp_test > 0 || spec_gen > 0) {
     if (mtp_test > 0 && !mrope_grids.empty()) {
       fprintf(stderr, "mrope: mtp-test not supported (acceptance harness "
@@ -487,7 +518,7 @@ int main(int argc, char** argv) {
   std::vector<int> all = tokens;
   std::vector<float> logits;
 
-  if (!getenv("QWENOX_NOWARMUP") && mtp_test == 0 && spec_gen == 0) {
+  if (!getenv("QWENOX_NOWARMUP") && !vseg_selftest_spec && mtp_test == 0 && spec_gen == 0) {
     // warmup: one dummy chunk prefill, then reset (see serve path above).
     // Skipped for mtp/spec modes: tap capture would ingest warmup rows.
     std::vector<int> warm((size_t)m.maxbatch, 0);

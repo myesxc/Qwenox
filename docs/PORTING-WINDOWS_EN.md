@@ -9,6 +9,30 @@
 > source code is in `tools/winprobe/` and can be re-run.
 > **Third version: the port is complete and verified**, see the next section.
 
+## VRAM Capacity (measured 2026-10-13, current)
+
+The process allocates one block of device memory at startup (the arena, capped at 95 GiB) and sub-allocates
+everything from it; whatever does not fit falls back to `hipMalloc`, which by the rules in "VRAM allocation"
+below lands in shared memory. Actual arena use (maximum offset from `QWENOX_ARENA_DEBUG=1`) in the production
+config (same environment as the tray app, MTP on, vision tower on, prefill chunk 8192):
+
+| Configuration | v2 hgn | UD-IQ4_XS + MTP | UD-IQ4_XS without MTP | w4b |
+|---|---|---|---|---|
+| 256K pool, 4 slots | 82.6 GiB | 83.9 GiB | 79.4 GiB | 88.8 GiB |
+| 512K pool (256K per request), 2 slots | 92.2 GiB | 93.5 GiB | — | estimate 98.8, 6 GiB falls back |
+| 512K pool (256K per request), 8 slots | 93.8 GiB | estimate 95.8, 66 MiB falls back | — | — |
+| YaRN 512K (512K per request), 2 slots | 93.3 GiB | 94.5 GiB | — | — |
+
+- Each extra 256K of pool costs ~9.6 GiB, each extra slot ~0.27 GiB. v2 uses the same amount with or without
+  `mtp.hgn` (the body already contains the draft head).
+- The arena reserve is estimate + 4 GiB headroom, capped at 95 GiB; at 512K only 1–3 GiB of headroom is left
+  for run-time allocations (image-heavy multimodal requests etc.). Task Manager's "Dedicated GPU memory" shows
+  the reserved block plus ~1.3 GiB.
+- Cold start (weights read into the arena): v2 ~35 s, UD-IQ4_XS ~50–60 s, w4b ~35 s.
+- Only startup footprint and one 8K request were tested; 512K was not actually filled. To rerun:
+  `bash tools/vram_footprint_win.sh` (1–2 minutes per config, stop the production service first; pick configs
+  with `CASES=`, summary in `logs/vram_footprint.txt`).
+
 ## Port Results (wrapped up 2026-09-19, all measured)
 
 **Port complete: the engine and the OpenAI-compatible API run at full
@@ -41,7 +65,7 @@ Verification matrix (all PASS):
 > KLD and decode are unchanged (see the "hgn 路由专家也走 WMMA" section in [GGUF.md](GGUF.md)). With it on,
 > `GDEC_MOE_LT=1` has no effect and its dequant/gather buffers (~0.4 GiB at chunk 8192, ~0.8 GiB at 16384)
 > are not allocated; the arena estimate shrinks accordingly. So Windows stays on hgn (~11 GiB less memory
-> than GGUF).
+> than UD-Q4_K_XL).
 >
 > **Measured on Windows (2026-09-26, heretic.hgn, same env as the start_win.sh production
 > config)**: the kernel works but the gain is markedly smaller than on Linux. 32K @ chunk 16384
@@ -53,6 +77,12 @@ Verification matrix (all PASS):
 > gently from 1015.8 to 938.4 tok/s, **~1000 tok/s average**, no cliff; the per-chunk decline
 > comes from PLE on-demand reads growing with prefix length (ple_wait rises chunk over chunk
 > in prof), which is expected.
+>
+> **Update 2026-10-13 (GGUF starts on Windows)**: the pure-GGUF start is ported to Windows, targeting
+> Unsloth `UD-IQ4_XS` (experts IQ3_S/IQ4_XS/IQ4_NL/Q8_0, 60.4 GiB trunk resident; with the Q8_0 MTP sidecar its
+> arena use is about 1.3 GiB *more* than v2 hgn, and only without MTP does it save 3.2 GiB). Experts and dense weights are copied into the devarena; the PLE table is read from its
+> shard on demand. Pick "GGUF" in the settings panel; see [GGUF.md](GGUF.md) "UD-IQ4_XS (Windows)".
+> One-shot check: `bash tools/iq4xs_verify_win.sh`.
 >
 > **Update 2026-09-26 (high-quality hgn)**: the new 8-bit dense overlay + imatrix routed-expert
 > base (same hgn format, see [HGN-HQ.md](HGN-HQ.md)) brings KLD down from 0.163 to GGUF levels;
@@ -68,8 +98,10 @@ Key implementation points (differences relative to the Linux version):
   of GpuModel's allocation formulas; reservation = estimate + slack
   (`GDEC_ARENA_SLACK_GB`, default 4 GiB), capped at `GDEC_ARENA_CAP_GB`
   (default **95.0**, matching the measured upper bound of the 96 GiB BIOS
-  split). Windows defaults to prefill chunk 8192 (`eff_maxbatch`; Linux
-  32768). **Do not set `GDEC_PREFILL_CHUNK=16384` at 256K** (it triggers
+  split). Windows defaults to prefill chunk 6144 (`eff_maxbatch`; Linux
+  32768): 64K steady-state PP is within ~0.5% of 8192, the workspace is
+  ~1.7 GiB smaller, and the B3 split-K (only at P >= 8192) stays off
+  (4096 is ~5% slower). **Do not set `GDEC_PREFILL_CHUNK=16384` at 256K** (it triggers
   truncation + overflow fallback); with maxctx ≤ 40K, 16384 fits and PP is
   ~6% faster (see the measurements in the verification matrix).
 - **New weight loader** (`load_arena` Windows branch): CreateFile

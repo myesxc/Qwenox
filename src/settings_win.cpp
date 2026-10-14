@@ -58,7 +58,7 @@ std::wstring to_w(const std::string& s) {
 }
 
 int msgbox(const std::string& text, UINT flags) {
-    return MessageBoxW(nullptr, to_w(text).c_str(), L"gfx1151-engine",
+    return MessageBoxW(nullptr, to_w(text).c_str(), L"Qwenox",
                        flags | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
@@ -185,7 +185,7 @@ int main() {
 
     // 防多开（避免两个设置窗口同时写 service.conf）。句柄不关，进程退出时系统回收。
     // 与 start_win.exe 的 mutex 不同名：服务跑着也能开设置（端口检查会降级为提示）。
-    CreateMutexW(nullptr, FALSE, L"Local\\gfx1151-engine-settings");
+    CreateMutexW(nullptr, FALSE, L"Local\\Qwenox-settings");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         msgbox(TR("设置窗口已经打开了。", "The settings window is already open."),
                MB_OK | MB_ICONINFORMATION);

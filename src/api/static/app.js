@@ -3,10 +3,11 @@
  * - 四个页面（总览/用量/请求/采样），hash 路由，左侧按钮分页。
  * - 文案双语：静态文本在 index.html 挂 data-i18n 键，动态文案走 t()；
  *   语言存 localStorage，首次按浏览器语言自动选择，侧栏 EN/中文 按钮切换。
- * - 数据源：/health /memory /power /admin/overrides /reqstat/page /reqstat/tail。
+ * - 数据源：/health /memory /power（功耗 + 温度）/admin/overrides /reqstat/page /reqstat/tail。
  *   请求页无筛选条件时走 /reqstat/page 服务端分页（可翻阅全部历史）；
  *   设了筛选条件回退到 tail 最近 1000 条内存过滤。用量页仍按 tail 聚合，
  *   按天聚合端点落地后再切换（见 usage-note）。
+ * - 界面风格（卡带 / 打孔机）存 localStorage，<html data-style> 切换皮肤，见"界面风格"一节。
  */
 
 // ---------------- 多语言 ----------------
@@ -15,6 +16,7 @@ const I18N = {
   zh: {
     "app.title": "Qwen-Flash-Server 控制台",
     "hint.theme": "切换明暗主题",
+    "hint.style": "切换界面风格（卡带 / 打孔机）",
     "nav.overview": "总览", "nav.usage": "用量", "nav.requests": "请求",
     "common.loading": "加载中…",
     "common.refresh": "刷新", "common.all": "全部", "common.read_failed": "读取失败",
@@ -25,6 +27,11 @@ const I18N = {
     "ov.mem": "显存与内存", "ov.power": "功耗",
     "power.socket": "整机封装", "power.gfx": "GPU 功耗", "power.cpu": "CPU 功耗",
     "power.na": "功耗读数不可用",
+    "ov.temp": "温度",
+    "temp.gpu": "GPU 核心", "temp.hotspot": "GPU 热点", "temp.cpu": "CPU", "temp.soc": "SoC",
+    "temp.na": "温度读数不可用",
+    "temp.note": "刻度 0–100 °C；≥80 °C 偏热，≥90 °C 过热",
+    "temp.warm": "偏热", "temp.hot": "过热",
     "health.status": "状态", "health.busy_field": "忙闲",
     "health.busy_yes": "推理中", "health.busy_no": "空闲",
     "health.inflight": "在途请求", "health.model": "模型",
@@ -102,7 +109,7 @@ const I18N = {
     "cfg.weights_ver": "权重版本",
     "cfg.ver_v1": "V1（单文件，n-gram 内嵌主权重）",
     "cfg.ver_v2": "V2（主权重 + 独立 n-gram 文件）",
-    "cfg.ver_gguf": "GGUF（仅 Linux 脚本启动）",
+    "cfg.ver_gguf": "GGUF",
     "cfg.save": "保存配置", "cfg.reload": "重新读取",
     "cfg.s_dirty": "有未保存的修改", "cfg.s_loaded": "已读取",
     "cfg.s_saved": "已保存，下次启动引擎时生效",
@@ -117,6 +124,7 @@ const I18N = {
   en: {
     "app.title": "Qwen-Flash-Server console",
     "hint.theme": "toggle light/dark theme",
+    "hint.style": "switch UI style (cassette / punch card)",
     "nav.overview": "Overview", "nav.usage": "Usage", "nav.requests": "Requests",
     "common.loading": "Loading…",
     "common.refresh": "Refresh", "common.all": "All", "common.read_failed": "read failed",
@@ -127,6 +135,11 @@ const I18N = {
     "ov.mem": "VRAM & memory", "ov.power": "Power",
     "power.socket": "Package", "power.gfx": "GPU", "power.cpu": "CPU",
     "power.na": "power reading unavailable",
+    "ov.temp": "Temperature",
+    "temp.gpu": "GPU core", "temp.hotspot": "GPU hotspot", "temp.cpu": "CPU", "temp.soc": "SoC",
+    "temp.na": "temperature reading unavailable",
+    "temp.note": "Scale 0–100 °C; ≥80 °C warm, ≥90 °C hot",
+    "temp.warm": "warm", "temp.hot": "hot",
     "health.status": "Status", "health.busy_field": "Busy",
     "health.busy_yes": "generating", "health.busy_no": "idle",
     "health.inflight": "In flight", "health.model": "Model",
@@ -211,7 +224,7 @@ const I18N = {
     "cfg.weights_ver": "Weights version",
     "cfg.ver_v1": "V1 (single file, n-gram embedded)",
     "cfg.ver_v2": "V2 (main weights + separate n-gram)",
-    "cfg.ver_gguf": "GGUF (started via Linux scripts only)",
+    "cfg.ver_gguf": "GGUF",
     "cfg.save": "Save config", "cfg.reload": "Reload",
     "cfg.s_dirty": "unsaved changes", "cfg.s_loaded": "loaded",
     "cfg.s_saved": "saved; takes effect on the next engine start",
@@ -281,6 +294,113 @@ document.getElementById("theme-btn").addEventListener("click", () => {
   applyTheme(cur === "dark" ? "light" : "dark");
   if (currentPage === "usage") drawUsageChart();  // 图表颜色跟随主题
 });
+
+// ---------------- 界面风格 ----------------
+// 每种风格一份 skin-<名>.css，规则全部挂在 <html data-style="<名>"> 下，页面预加载全部皮肤，
+// 切换只改属性。旋钮按 STYLES 顺序轮换，data-pos 决定指针角度。
+// 新增风格：STYLES 加一项；index.html 加 link 与首帧脚本白名单；各皮肤的旋钮 CSS 加档位。
+const STYLES = ["cassette", "punch"];
+
+function applyStyle(s) {
+  if (!STYLES.includes(s)) s = STYLES[0];
+  document.documentElement.dataset.style = s;
+  document.getElementById("style-btn").dataset.pos = s;
+  try { localStorage.setItem("qwenox-style", s); } catch (e) { /* 隐私模式 */ }
+  if (s === "punch") readerCountRefresh();
+}
+function initStyle() {
+  let saved = null;
+  try { saved = localStorage.getItem("qwenox-style"); } catch (e) { /* 同上 */ }
+  applyStyle(saved || document.documentElement.dataset.style);
+}
+document.getElementById("style-btn").addEventListener("click", () => {
+  const cur = STYLES.indexOf(document.documentElement.dataset.style);
+  applyStyle(STYLES[(cur + 1) % STYLES.length]);
+  if (currentPage === "usage") drawUsageChart();  // 图表颜色/字体跟随皮肤
+});
+
+// 打孔机风格的装饰件（其它风格下 .deco-punch 隐藏，启动时一次性生成，开销可忽略）
+function buildPunchDeco() {
+  // 寄存器灯板：32 盏灯各自的闪烁周期/相位（固定种子，每次加载一样）；.p = 空闲时常亮的图案
+  let seed = 7;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const lamps = document.getElementById("lamps");
+  for (let i = 0; i < 32; i++) {
+    const l = document.createElement("i");
+    l.style.setProperty("--d", (0.35 + rnd() * 1.1).toFixed(2) + "s");
+    l.style.setProperty("--o", (-rnd()).toFixed(2) + "s");
+    if (rnd() < 0.38) l.className = "p";
+    lamps.appendChild(l);
+  }
+
+  // 卡片右端 73–80 列序号区：data-seq 的 8 个字符按 Hollerith 编码打孔（行序 12、11、0–9）
+  const holes = (ch) => {
+    const A = "ABCDEFGHI", J = "JKLMNOPQR", S = "STUVWXYZ";
+    if (/[0-9]/.test(ch)) return [ch];
+    if (A.includes(ch)) return ["12", String(A.indexOf(ch) + 1)];
+    if (J.includes(ch)) return ["11", String(J.indexOf(ch) + 1)];
+    if (S.includes(ch)) return ["0", String(S.indexOf(ch) + 2)];
+    return [];
+  };
+  const ROWS = ["12", "11", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+  for (const card of document.querySelectorAll(".card[data-seq]")) {
+    const seq = card.dataset.seq.toUpperCase().padEnd(8).slice(0, 8);
+    const g = document.createElement("div");
+    g.className = "seq deco-punch";
+    g.setAttribute("aria-hidden", "true");
+    for (const ch of seq) {
+      const c = document.createElement("span"); c.className = "ip"; c.textContent = ch; g.appendChild(c);
+    }
+    for (const r of ROWS) {
+      for (const ch of seq) {
+        const c = document.createElement("span");
+        c.textContent = /^\d$/.test(r) ? r : "";
+        if (holes(ch).includes(r)) c.className = "h";
+        g.appendChild(c);
+      }
+    }
+    const cols = document.createElement("span");
+    cols.className = "seq-cols";
+    cols.innerHTML = "<span>73</span><span>80</span>";
+    g.appendChild(cols);
+    card.appendChild(g);
+  }
+
+  // 铭牌纸带：8 通道 ASCII 打出文字，中间一排小送带孔
+  const svg = document.getElementById("plate-tape");
+  const text = " QWENOX  GFX1151 ", pitch = 7, W = text.length * pitch + 6, H = 26;
+  let body = `<rect x="0" y="0" width="${W}" height="${H}" rx="1" fill="#e9dfb6"/>`;
+  [...text].forEach((ch, i) => {
+    const x = 3 + i * pitch + pitch / 2, code = ch.charCodeAt(0);
+    body += `<circle cx="${x}" cy="13" r="1" fill="#3c3a35"/>`;
+    for (let b = 0; b < 8; b++) {
+      if (!(code & (1 << b))) continue;
+      const y = b < 3 ? 3.5 + b * 2.6 : 15.9 + (b - 3) * 2.2;
+      body += `<circle cx="${x}" cy="${y.toFixed(1)}" r="1.1" fill="#3c3a35"/>`;
+    }
+  });
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("width", String(W * 1.6));
+  svg.innerHTML = body;
+}
+
+// 读卡机计数器 = 累计请求数（/reqstat/page 的 total）。只在打孔机风格下取：
+// 一次推理结束（ENG 灯离开 busy）时刷新，平时最多 30 秒一次。
+const readerCount = { at: 0, lastDot: "" };
+async function readerCountRefresh() {
+  if (document.documentElement.dataset.style !== "punch") return;
+  readerCount.at = Date.now();
+  try {
+    const j = await getJSON("/reqstat/page?offset=0&limit=1");
+    document.getElementById("reader-count").textContent =
+      String(Math.min(j.total || 0, 999999)).padStart(6, "0");
+  } catch (e) { /* 计数器只是装饰，失败保持原值 */ }
+}
+function readerCountTick(dotCls) {
+  const finished = readerCount.lastDot === "busy" && dotCls !== "busy";
+  readerCount.lastDot = dotCls;
+  if (finished || Date.now() - readerCount.at > 30000) readerCountRefresh();
+}
 
 // ---------------- 工具 ----------------
 
@@ -421,6 +541,7 @@ function updateEngLed(h) {
     : engState === "exited" ? "exited" : "stopped";
   dot.className = "brand-dot " + dotCls;
   dot.title = t("led.eng_tip_" + dotCls) + (h.engine_external ? t("led.eng_external") : "");
+  readerCountTick(dotCls);
 }
 
 function engLedDown() {
@@ -509,10 +630,12 @@ async function refreshMemory() {
   }
 }
 
+// 功耗卡和温度卡共用一次 /power 请求（同一次传感器快照）。
 async function refreshPower() {
   const el = document.getElementById("ov-power");
+  let p = null;
   try {
-    const p = await getJSON("/power");
+    p = await getJSON("/power");
     if (!p.available) {
       fillKv(el, [[t("ov.power"), t("power.na")]]);
     } else {
@@ -525,6 +648,49 @@ async function refreshPower() {
   } catch (e) {
     fillKv(el, [[t("ov.power"), t("common.read_failed")]]);
   }
+  renderTemps(p);
+}
+
+// 温度条：刻度 0–100 °C；≥TEMP_WARM 偏热（琥珀/橙章），≥TEMP_HOT 过热（红）。
+// 旧版后端没有 temp_* 字段时 temp_available 为 undefined → 显示不可用。
+const TEMP_WARM = 80, TEMP_HOT = 90;
+function renderTemps(p) {
+  const bars = document.getElementById("temp-bars");
+  const note = document.getElementById("temp-note");
+  bars.textContent = "";
+  bars.classList.remove("muted");
+  note.textContent = "";
+  if (!p) {
+    bars.textContent = t("common.read_failed");
+    bars.classList.add("muted");
+    return;
+  }
+  const items = [
+    ["temp.cpu", p.cpu_temp_c],
+    ["temp.gpu", p.gpu_temp_c],
+    ["temp.hotspot", p.gpu_hotspot_c],
+    ["temp.soc", p.soc_temp_c],
+  ].filter(([, v]) => v != null);
+  if (!p.temp_available || items.length === 0) {
+    bars.textContent = t("temp.na");
+    bars.classList.add("muted");
+    return;
+  }
+  for (const [key, c] of items) {
+    const lvl = c >= TEMP_HOT ? "hot" : c >= TEMP_WARM ? "warm" : "";
+    const row = document.createElement("div");
+    row.className = "bar-row temp-row" + (lvl ? " " + lvl : "");
+    const l = document.createElement("span"); l.className = "bar-label"; l.textContent = t(key);
+    const tr = document.createElement("div"); tr.className = "bar-track";
+    const fl = document.createElement("div"); fl.className = "bar-fill";
+    fl.style.width = Math.max(0, Math.min(100, c)).toFixed(0) + "%";
+    tr.appendChild(fl);
+    const v = document.createElement("span"); v.className = "bar-value";
+    v.textContent = c + " °C" + (lvl ? " · " + t("temp." + lvl) : "");
+    row.append(l, tr, v);
+    bars.appendChild(row);
+  }
+  note.textContent = t("temp.note");
 }
 
 // ---------------- 采样（服务端覆盖编辑） ----------------
@@ -815,9 +981,12 @@ function drawUsageChart() {
   const cGrid = css.getPropertyValue("--border").trim();
   const cText = css.getPropertyValue("--text-muted").trim();
   const cTrack = css.getPropertyValue("--bg-raised").trim();
+  // 皮肤可选：--chart-font-family（默认 system-ui）、--chart-grid-dash（如 "3 3"，默认实线）
+  const fam = css.getPropertyValue("--chart-font-family").trim() || "system-ui";
+  const dash = css.getPropertyValue("--chart-grid-dash").trim().split(/\s+/).filter(Boolean).map(Number);
   g.clearRect(0, 0, W, H);
   if (!usageAgg.length) {
-    g.fillStyle = cText; g.font = "13px system-ui";
+    g.fillStyle = cText; g.font = "13px " + fam;
     g.fillText(t("usage.empty"), 20, 30);
     return;
   }
@@ -825,8 +994,9 @@ function drawUsageChart() {
   const pw = W - ML - MR, ph = H - MT - MB;
   const maxV = Math.max(...usageAgg.map((d) => d.prompt + d.gen)) || 1;
   const nice = niceCeil(maxV);
-  g.strokeStyle = cGrid; g.fillStyle = cText; g.font = "11px system-ui";
+  g.strokeStyle = cGrid; g.fillStyle = cText; g.font = "11px " + fam;
   g.lineWidth = 1;
+  g.setLineDash(dash);
   for (let i = 0; i <= 4; i++) {
     const v = nice * i / 4;
     const y = MT + ph - ph * i / 4;
@@ -834,6 +1004,7 @@ function drawUsageChart() {
     g.textAlign = "right"; g.textBaseline = "middle";
     g.fillText(compactNum(v), ML - 6, y);
   }
+  g.setLineDash([]);
   const n = usageAgg.length;
   const slot = pw / n;
   const bw = Math.min(46, slot * 0.62);
@@ -1401,6 +1572,8 @@ function enterEngine() {
 
 // ---------------- 启动 ----------------
 
+buildPunchDeco();
+initStyle();
 initTheme();
 applyLang();
 showPage(location.hash.replace(/^#\/?/, "") || "overview");

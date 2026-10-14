@@ -1,5 +1,6 @@
 // moe_gguf_test.cu — standalone check + bench of the GGUF routed-expert WMMA
-// kernels (src/gpu/parts/26_kernels_moe_gguf.inc) on real GGUF expert weights.
+// kernels (26_kernels_moe_gguf.inc; IQ formats via 27_kernels_moe_lut.inc,
+// moe_ggx_up / moe_ggx_down as the engine calls them) on real GGUF expert weights.
 //
 //   moe_gguf_test FIRST_SHARD.gguf [--layer L] [--P N] [--iters N]
 //                 [--check-experts N] [--seed S] [--tol X]
@@ -28,6 +29,7 @@
 
 struct MoeTile { int expert, first, count; };
 #include "../src/gpu/parts/26_kernels_moe_gguf.inc"
+#include "../src/gpu/parts/27_kernels_moe_lut.inc"  // IQ4_NL / IQ4_XS / IQ3_S (moe_ggx_*)
 
 #define CK(x)                                                                    \
   do {                                                                           \
@@ -144,13 +146,13 @@ int main(int argc, char** argv) {
   CK(hipMemset(d_pairs, 0xFF, (size_t)npairs * D * 4));    // NaN
 
   auto run_up = [&]() {
-    if (!moe_gg_up(tg.type, dg, du, d_x, d_tok, d_tiles, d_nt, max_tiles, d_hid, MID, D, 0)) {
+    if (!moe_ggx_up(tg.type, dg, du, d_x, d_tok, d_tiles, d_nt, max_tiles, d_hid, MID, D, 0)) {
       fprintf(stderr, "moe_gg_up: unsupported type %s\n", gguf::type_name(tg.type));
       exit(2);
     }
   };
   auto run_dn = [&]() {
-    if (!moe_gg_down(td.type, dd, d_hid, d_tiles, d_nt, max_tiles, d_pairs, D, MID, 0)) {
+    if (!moe_ggx_down(td.type, dd, d_hid, d_tiles, d_nt, max_tiles, d_pairs, D, MID, 0)) {
       fprintf(stderr, "moe_gg_down: unsupported type %s\n", gguf::type_name(td.type));
       exit(2);
     }

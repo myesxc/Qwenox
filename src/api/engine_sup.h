@@ -34,6 +34,10 @@ Status status(const std::string& host, int port);
 // root 是 service.conf 所在目录：引擎 exe 为 <root>/build/qwenox-engine-win.exe，
 // cwd 与 logs\ 都以 root 为基准。已在运行/启动中返回 false。
 // spawn 成功后立即返回（state=starting），就绪/退出由监管线程异步推进。
+// conf[kWeightsVerKey] = the "# start_win: weights=" marker (v1|v2|gguf), filled
+// by the caller; "gguf" starts the engine from GGUF_FILE (+ GGUF_MTP_FILE,
+// GGUF_VISION_FILE) instead of the hgn keys.
+inline constexpr const char* kWeightsVerKey = "__WEIGHTS_VER";
 bool start(const std::string& root, const svcconf::Conf& conf, std::string* err);
 
 // 停掉本进程拉起的引擎；外部引擎（external）拒绝并返回 false。

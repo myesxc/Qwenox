@@ -25,7 +25,7 @@ architecture flags directly to other graphics cards.
 ```bash
 bash build.sh                 # all: build engine + benchmark + API in parallel (default)
 bash build.sh --bundle        # distribution build with all runtime dependencies
-bash build.sh engine [name]   # engine only → build/<name> (default qwenox)
+bash build.sh engine [name]   # engine only → build/<name> (default qwenox-engine)
 bash build.sh bench           # standalone performance benchmark only
 bash build.sh api             # API server + CLI tools only
 bash build.sh test            # build ktest and run kernel unit tests
@@ -205,8 +205,8 @@ and start it there, or use the tray right-click menu. The old launcher with
 the native setup panel is archived in `attic/launcher/` and no longer built
 or maintained.
 **Configuration lives in the root `service.conf`** (the same file as the Linux
-launchers; Windows currently supports hgn only and reads the "hgn" section, the
-GGUF section has no effect): edit it directly, or on the console's `#/engine`
+launchers; Windows reads the "hgn" section by default, or the GGUF section after
+GGUF is selected in the console, UD-IQ4_XS only): edit it directly, or on the console's `#/engine`
 page (backed up to `service.conf.bak` before writing, applied on the next
 engine start); precedence is environment variables > service.conf >
 built-in defaults. Clients connect to `http://127.0.0.1:8731/v1` (standard OpenAI
@@ -246,10 +246,10 @@ of rocBLAS/hipBLASLt (~30M total, not the all-architecture 1.2G). **The
 artifacts are self-contained: copy `build/` to any Windows machine of the
 same architecture and it runs — no need to install ROCm/TheRock, and no
 HIP_PATH/ROCM_PATH is set** (see PORTING-WINDOWS_EN.md for de-rooted
-real-world testing). The GPU needs enough VRAM partitioned in BIOS (heretic
-68 GiB weights + 256K context measured at a full 95 GiB, so partition 96
-GiB). `start_win.exe` / `start_win.sh` share the root `service.conf` with
-the Linux launchers (hgn section only) (model paths, ports, context window, etc. are all edited
+real-world testing). Partition 96 GiB of VRAM for the GPU in BIOS (the engine can
+use about 95 GiB; v2 weights with a 256K context measured 82.6 GiB, a 512K
+pool 92–94 GiB; see the "Windows" section of README_EN). `start_win.exe` / `start_win.sh` share the root `service.conf` with
+the Linux launchers (model paths, ports, context window, etc. are all edited
 there; environment variables can override temporarily).
 
 ## Optional tools and common build problems

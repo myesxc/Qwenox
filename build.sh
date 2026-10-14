@@ -4,7 +4,7 @@
 # 用法:
 #   bash build.sh                 # all:引擎 + benchmark + API(服务器+CLI工具),并行
 #   bash build.sh --bundle        # 同上，并打包分发所需的全部运行库
-#   bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 qwenox)
+#   bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 qwenox-engine)
 #   bash build.sh bench           # 编译独立性能测试工具 → build/qwenox-bench
 #   bash build.sh api             # 只编 API 服务器 + CLI 工具
 #   bash build.sh test            # 编 ktest 并运行
@@ -34,7 +34,7 @@ done
 set -- "${POSITIONAL[@]}"
 [[ $# -le 2 ]] || { usage >&2; exit 2; }
 TARGET="${1:-all}"
-ENGINE_NAME="${2:-qwenox}"
+ENGINE_NAME="${2:-qwenox-engine}"
 case "$TARGET" in
   all|engine|api|bench|test) ;;
   *) usage >&2; exit 2 ;;
@@ -48,7 +48,7 @@ mkdir -p build
 exec 9>build/.build.lock
 flock -n 9 || { echo '本目录已有编译任务在运行' >&2; exit 1; }
 exec 8>"${XDG_RUNTIME_DIR:-/run/user/$UID}/hgn-work.lock"
-flock -n 8 || { echo '另一个 gfx1151-engine 编译或启动任务正在运行' >&2; exit 1; }
+flock -n 8 || { echo '另一个 Qwenox 编译或启动任务正在运行' >&2; exit 1; }
 
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
 if [[ "$TARGET" != api ]]; then

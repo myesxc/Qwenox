@@ -1299,6 +1299,11 @@ struct GenReq {
   bool sample = false;
   float temp = 1.0f, top_p = 0.0f, min_p = 0.0f;  int top_k = 0;
   uint64_t seed = 0;
+  // SEEDED: the client gave this seed explicitly (the API otherwise draws a
+  // random one). Seeded sampled requests pick their MTP γ from a fixed
+  // occupancy (PARALLEL) so the output is reproducible under concurrency;
+  // unseeded ones follow the live rendezvous size (Model::OccGamma).
+  bool seeded = false;
   // PENALTY (presence, frequency) / BIAS (tid,val pairs) / LOGPROBS: sampler-only.
   float presence = 0.0f, frequency = 0.0f;
   std::vector<std::pair<int, float>> bias;
@@ -1687,6 +1692,8 @@ static GenReq parse_gen(std::istringstream& ss) {
       }
     } else if (tok == "LOGPROBS") {
       g.logprobs = true;
+    } else if (tok == "SEEDED") {
+      g.seeded = true;
     } else if (tok == "MROPE") {
       int k;
       // One grid per image: same ceiling as VIMG (was 64, a hidden 2nd cap).
@@ -1768,17 +1775,101 @@ static GenReq parse_gen(std::istringstream& ss) {
 // N=1 keeps the old batch-1 semantics: live-state reuse is per connection
 // (a new connection starts with an empty hist), no hooks are installed.
 
+// QWENOX_TURN_PROF=1: GPU-turn time accounting for concurrent decode
+// (diagnostic only; off = zero cost). Every release syncs the stream so a
+// hold's time includes the GPU work it enqueued; time with no owner is the
+// hand-off gap (thread wake-ups, rendezvous waits). Tags say who held it.
+enum TurnTag { TT_WORKER = 0, TT_VR = 1, TT_DR = 2, TT_N = 3 };
+static thread_local int tl_turn_tag = TT_WORKER;
+static const bool g_turn_prof = [] {
+  const char* e = getenv("QWENOX_TURN_PROF");
+  return e && *e && strcmp(e, "0") != 0;
+}();
+struct TurnProf {
+  using clk = std::chrono::steady_clock;
+  clk::time_point acq{}, rel{}, last_print{};
+  double held[TT_N] = {}, idle = 0;  // ms, since last print
+  long holds[TT_N] = {};
+  bool have_rel = false;
+  // Called under the turnstile (only the owner touches it).
+  void on_acquire() {
+    acq = clk::now();
+    if (have_rel) idle += std::chrono::duration<double, std::milli>(acq - rel).count();
+  }
+  void on_release(int tag) {
+    (void)hipStreamSynchronize(g_str);
+    rel = clk::now();
+    have_rel = true;
+    held[tag] += std::chrono::duration<double, std::milli>(rel - acq).count();
+    holds[tag]++;
+    if (last_print.time_since_epoch().count() == 0) last_print = rel;
+    const double span = std::chrono::duration<double, std::milli>(rel - last_print).count();
+    if (span >= 10000.0) {
+      const double tot = held[0] + held[1] + held[2] + idle;
+      fprintf(stderr,
+              "%s [turnprof] %.1fs: verify-exec %.1f%% (%ld, %.1fms avg) "
+              "draft-exec %.1f%% (%ld, %.1fms avg) worker %.1f%% (%ld, %.2fms avg) "
+              "idle %.1f%%\n",
+              log_ts(), span / 1000.0, 100 * held[1] / tot, holds[1],
+              holds[1] ? held[1] / holds[1] : 0.0, 100 * held[2] / tot, holds[2],
+              holds[2] ? held[2] / holds[2] : 0.0, 100 * held[0] / tot, holds[0],
+              holds[0] ? held[0] / holds[0] : 0.0, 100 * idle / tot);
+      if (g_vseg_calls)
+        fprintf(stderr,
+                "%s [turnprof] batched verify: %ld calls, %.1f rows avg, "
+                "PLE join wait %.1fms avg (gather %.1fms), host enqueue %.1fms avg\n",
+                log_ts(), g_vseg_calls, (double)g_vseg_rows / g_vseg_calls,
+                g_vseg_ple_ms / g_vseg_calls, g_vseg_pleh_ms / g_vseg_calls,
+                g_vseg_enq_ms / g_vseg_calls);
+      g_vseg_calls = g_vseg_rows = 0;
+      g_vseg_ple_ms = g_vseg_pleh_ms = g_vseg_enq_ms = 0;
+      for (int i = 0; i < TT_N; i++) held[i] = 0, holds[i] = 0;
+      idle = 0;
+      last_print = rel;
+    }
+  }
+};
+static TurnProf g_turnprof;
+
 // FIFO ticket lock around the (single-threaded) GpuModel.
+// 10-13: a waiter may tag itself HEAVY with its remaining prompt tokens
+// (acquire(rem > 0)): its next GPU work is a big prompt chunk. Grant order is
+// unchanged (FIFO); the owner only reads the tags (waiters()) to decide whether
+// lending or yielding can help anyone (see yield_hook / borrow_query).
 struct Turnstile {
   std::mutex mu;
   std::condition_variable cv;
   uint64_t next = 0, serving = 0;
-  void acquire() {
+  std::vector<std::pair<uint64_t, int>> heavy;  // (ticket, remaining) still waiting
+  uint64_t acquire(int heavy_rem = 0) {  // returns this grant's ticket (QWENOX_VR_CHECK)
     std::unique_lock<std::mutex> lk(mu);
     const uint64_t t = next++;
+    if (heavy_rem > 0) heavy.emplace_back(t, heavy_rem);
     cv.wait(lk, [&] { return serving == t; });
+    if (heavy_rem > 0)
+      for (size_t i = 0; i < heavy.size(); i++)
+        if (heavy[i].first == t) {
+          heavy.erase(heavy.begin() + (long)i);
+          break;
+        }
+    if (g_turn_prof) g_turnprof.on_acquire();
+    return t;
+  }
+  struct Waiters {
+    int light = 0, heavy = 0;
+    int min_heavy_rem = INT_MAX;
+  };
+  Waiters waiters() {  // owner only: who is queued behind it
+    std::lock_guard<std::mutex> lk(mu);
+    Waiters w;
+    const int all = (int)(next - serving) - 1;
+    w.heavy = (int)heavy.size();
+    w.light = std::max(0, all - w.heavy);
+    for (const auto& h : heavy) w.min_heavy_rem = std::min(w.min_heavy_rem, h.second);
+    return w;
   }
   void release() {
+    if (g_turn_prof) g_turnprof.on_release(tl_turn_tag);
     {
       std::lock_guard<std::mutex> lk(mu);
       serving++;
@@ -1977,13 +2068,45 @@ static void slot_leave(int s) {
   g_scv.notify_all();
 }
 
+// 10-13 prefill scheduling knobs (both default on; =0 restores the old rule
+// for A/B). QWENOX_CONC_LEND_LIGHT_ONLY: mid-chunk lending only when a light
+// worker waits. QWENOX_PREFILL_SRPT: between chunks of a long prompt, hand the
+// GPU to another prompt only if it has less left (else lend to light workers
+// and keep going), instead of alternating chunk by chunk.
+static bool lend_light_only() {
+  static const bool v = !GpuModel::env_zero("QWENOX_CONC_LEND_LIGHT_ONLY");
+  return v;
+}
+static bool prefill_srpt() {
+  static const bool v = !GpuModel::env_zero("QWENOX_PREFILL_SRPT");
+  return v;
+}
+
+static void borrow_abort_check();
+static void borrow_turn(GpuModel& m);
+
 // GpuModel::yield_fn: hand the GPU to the next queued worker, then fail
 // this request if a pool overflow picked it as the victim meanwhile.
+// Between chunks of a long prompt (pf_rem() > 0) with SRPT on: yield to a
+// heavy waiter only if it has less prompt left; otherwise give light workers
+// one round each (borrow_turn: heavy waiters requeue) and keep the GPU.
 static void yield_hook(GpuModel& m) {
   if (tl_slot < 0) return;
-  if (g_turn.contended()) {
+  const int rem = m.pf_rem();
+  if (rem > 0 && prefill_srpt()) {
+    const Turnstile::Waiters w = g_turn.waiters();
+    if (w.heavy > 0 && w.min_heavy_rem < rem) {
+      g_turn.release();
+      g_turn.acquire(rem);
+      m.bind(tl_slot);
+    } else if (w.light > 0) {
+      m.heavy_rem_ = rem;
+      borrow_turn(m);  // includes the abort check
+      return;
+    }
+  } else if (g_turn.contended()) {
     g_turn.release();
-    g_turn.acquire();
+    g_turn.acquire(rem);
     m.bind(tl_slot);
   }
   bool ab;
@@ -1999,7 +2122,16 @@ static void yield_hook(GpuModel& m) {
 // around the FIFO once (borrowers may start only chunks of <= conc_rmax_
 // rows while it is up), then rebinds our slot. borrow_skip runs on a
 // borrower whose next chunk is heavy: requeue behind the owner and retry.
-static bool borrow_query() { return g_turn.contended(); }
+static bool borrow_query() {
+  if (!lend_light_only()) return g_turn.contended();
+  return g_turn.waiters().light > 0;
+}
+// GpuModel::heavy_gate_fn: the chunk about to start (rem prompt tokens left)
+// should requeue because a waiting prompt has strictly less left.
+static bool heavy_gate(GpuModel&, int rem) {
+  if (!prefill_srpt()) return false;
+  return g_turn.waiters().min_heavy_rem < rem;
+}
 static void borrow_abort_check() {
   bool ab;
   {
@@ -2008,19 +2140,408 @@ static void borrow_abort_check() {
   }
   if (ab) throw KvOverflow("aborted: KV pool needed by an earlier request");
 }
+// Both re-acquire tagged heavy with m.heavy_rem_ (set by the caller: the
+// rest of this prompt), so the owner that gets the GPU next knows a prompt
+// is waiting and how much it has left.
 static void borrow_turn(GpuModel& m) {
+  const int rem = m.heavy_rem_;
   g_borrow_light.fetch_add(1, std::memory_order_acq_rel);
   g_turn.release();
-  g_turn.acquire();
+  g_turn.acquire(rem);
   g_borrow_light.fetch_sub(1, std::memory_order_acq_rel);
   m.bind(tl_slot);
   borrow_abort_check();
 }
 static void borrow_skip(GpuModel& m) {
+  const int rem = m.heavy_rem_;
   g_turn.release();
+  g_turn.acquire(rem);
+  m.bind(tl_slot);
+  borrow_abort_check();
+}
+
+// ---- D2-S2a: verify rendezvous pool (VerifyPool) ---------------------------
+// Greedy spec workers reach the rendezvous after drafting a round: they hand
+// the GPU turn over and wait; the last submitter (or a waiter whose window
+// elapsed) becomes the executor and runs ONE batched multi-segment verify
+// for the round (GpuModel::verify_segments, bit-identical to serial per the
+// S1c selftest). Judging/emit/rollback stay on each worker after it
+// re-acquires the turn, so abort/cancel semantics are unchanged.
+struct VrReq {
+  int slot;
+  const std::vector<int>* vt;  // worker stack; valid while the worker blocks
+  int base;                    // q+1
+  int* vout;                   // worker stack v.data(), room for vt->size()
+  const std::function<void(int)>* post = nullptr;  // see GpuModel::vseg_pool_fn
+  bool done = false;
+  bool dropped = false;        // abort/guard refusal -> worker serial rerun
+  // QWENOX_VR_CHECK / QWENOX_VR_RESTORE (10-13): this segment's row window in
+  // the shared post-verify scratch (-1 = not recorded), its hash at the
+  // executor's release, and the executor's turn ticket.
+  int win_row0 = -1;
+  bool saved = false;
+  std::array<uint64_t, 4> win_hash{};
+  uint64_t exec_ticket = 0;
+};
+static bool vr_check_on() {
+  static const bool v = getenv("QWENOX_VR_CHECK") && !GpuModel::env_zero("QWENOX_VR_CHECK");
+  return v;
+}
+static bool vr_restore_on() { return GpuModel::vr_restore_env(); }  // default on
+static std::atomic<long> g_vrc_ok{0}, g_vrc_bad{0}, g_vrc_restored{0};
+struct VerifyPool {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::vector<VrReq*> pend;    // current round's submissions
+  int active = 0;              // workers able to submit this round (under mu)
+  bool executing = false;
+  std::chrono::steady_clock::time_point first_submit;
+  long batches = 0, solo = 0, timeouts = 0, fallbacks = 0;
+  long hist[9] = {};           // batch-size (segments) histogram
+};
+static VerifyPool g_vr;
+static int g_vr_wait_ms = 50;  // QWENOX_VR_WAIT_MS
+
+// Membership counting. Every exit path (eos, cancel, KvOverflow unwind) must
+// decrement, else the all-arrived trigger never fires and the pool stalls to
+// the timeout each round. Both spec_loop (VrActive) and spec_loop_chain
+// (VrLoop, via the callbacks) count the WHOLE decode loop — the round body
+// runs only while holding the GPU turn, so any finer scope never sees a
+// peer. Chain ngram rounds excuse themselves per round (they never submit).
+static void vseg_round_enter() {
+  std::lock_guard<std::mutex> lk(g_vr.mu);
+  g_vr.active++;
+}
+static void vseg_round_exit() {
+  {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    g_vr.active--;
+  }
+  g_vr.cv.notify_all();  // the round may now be complete without us
+}
+struct VrActive {
+  VrActive() { vseg_round_enter(); }
+  ~VrActive() { vseg_round_exit(); }
+};
+
+static int vseg_active() {
+  std::lock_guard<std::mutex> lk(g_vr.mu);
+  return g_vr.active;
+}
+
+// Executor half. Runs on the promoting worker's thread; acquires the GPU
+// turn (FIFO behind the peers, so their drafts finish first), runs the
+// batched verify, scatters the per-segment argmax rows into each worker's
+// vout, and wakes everyone. Call with the turn NOT held; returns with it
+// released again.
+static void vr_execute(GpuModel& m) {
+  tl_turn_tag = TT_VR;
+  const uint64_t my_ticket = g_turn.acquire();
+  m.bind(tl_slot);
+  std::vector<VrReq*> mine;
+  {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    mine.swap(g_vr.pend);
+  }
+  std::vector<GpuModel::VSeg> segs;
+  std::vector<VrReq*> run;  // run[i] owns segs[i]
+  int rows = 0;
+  for (VrReq* r : mine) {
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      if (g_slots[(size_t)r->slot].abort) { r->dropped = true; continue; }
+    }
+    const int P = (int)r->vt->size();
+    if (rows + P > m.kVSnapRows) {  // hard row budget
+      r->dropped = true;
+      g_vr.fallbacks++;
+      continue;
+    }
+    rows += P;
+    segs.push_back(GpuModel::VSeg{r->slot, r->vt, r->base});
+    run.push_back(r);
+  }
+  if (!segs.empty()) {
+    std::vector<int> v((size_t)rows);
+    if (m.verify_segments(segs.data(), (int)segs.size(), v.data())) {
+      int off = 0;
+      for (size_t i = 0; i < segs.size(); i++) {
+        const int P = (int)segs[i].toks->size();
+        memcpy(run[i]->vout, v.data() + off, (size_t)P * sizeof(int));
+        if (run[i]->post) (*run[i]->post)(off);  // rows still in d_logits_b
+        // 10-13: record this segment's shared row window before the turn is
+        // released (see GpuModel::vr_rows_each).
+        run[i]->exec_ticket = my_ticket;
+        if (vr_check_on() || vr_restore_on()) {
+          run[i]->win_row0 = off;
+          if (vr_check_on()) run[i]->win_hash = m.vr_rows_hash(off, P);
+          if (vr_restore_on()) run[i]->saved = m.vr_rows_save(segs[i].slot, off, P);
+        }
+        off += P;
+      }
+    } else {
+      // Batched pass refused by a guard: serial per segment — today's
+      // time-sliced behavior, still inside this worker's turn.
+      g_vr.fallbacks++;
+      fprintf(stderr, "%s [vr] batched verify refused (%zu segments, %d rows);"
+                      " serial fallback\n", log_ts(), segs.size(), rows);
+      // Every serial segment packs at its slot's vsnap_row0_ (0 from the
+      // spec loop), so segment i+1 overwrites segment i's rows: record and
+      // save each window right after its own verify (10-13).
+      for (size_t i = 0; i < segs.size(); i++) {
+        m.bind(segs[i].slot);
+        if (!m.verify_segments(&segs[i], 1, run[i]->vout)) {
+          run[i]->dropped = true;  // worker re-runs prefill_batch+batch_argmax
+          continue;
+        }
+        if (run[i]->post) (*run[i]->post)(0);
+        run[i]->exec_ticket = my_ticket;
+        if (vr_check_on() || vr_restore_on()) {
+          const int P = (int)segs[i].toks->size(), r0 = m.vsnap_row0_;
+          run[i]->win_row0 = r0;
+          if (vr_check_on()) run[i]->win_hash = m.vr_rows_hash(r0, P);
+          if (vr_restore_on()) run[i]->saved = m.vr_rows_save(segs[i].slot, r0, P);
+        }
+      }
+    }
+  }
+  static const bool vr_dbg = getenv("QWENOX_VR_DBG") != nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    for (VrReq* r : mine) r->done = true;
+    g_vr.executing = false;
+    g_vr.batches++;
+    g_vr.hist[std::min(segs.size(), (size_t)8)]++;
+    if (segs.size() <= 1) g_vr.solo++;
+    if (vr_dbg)
+      fprintf(stderr, "%s [vr] batch: %zu segs %d rows (batches %ld, solo %ld,"
+                      " timeouts %ld, fallbacks %ld)\n",
+              log_ts(), segs.size(), rows, g_vr.batches, g_vr.solo,
+              g_vr.timeouts, g_vr.fallbacks);
+  }
+  g_vr.cv.notify_all();
+  g_turn.release();
+  tl_turn_tag = TT_WORKER;
+}
+
+// Worker half (GpuModel::vseg_pool_fn), called from spec_loop holding the
+// GPU turn, drafts done. Returns true with vout filled, or false when the
+// pool could not run this segment (caller runs the serial verify).
+static bool vseg_pool(GpuModel& m, const GpuModel::VSeg& self, int* vout,
+                      const std::function<void(int)>* post) {
+  {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    if (g_vr.active <= 1) return false;  // sole decoder: keep the serial path
+  }
+  VrReq req{self.slot, self.toks, self.base, vout, post, false, false};
+  bool am_exec = false;
+  {
+    std::lock_guard<std::mutex> lk(g_vr.mu);
+    if (g_vr.pend.empty()) g_vr.first_submit = std::chrono::steady_clock::now();
+    g_vr.pend.push_back(&req);
+    if ((int)g_vr.pend.size() >= g_vr.active && !g_vr.executing)
+      am_exec = g_vr.executing = true;  // everyone is in: run the round
+  }
+  g_turn.release();  // let the peers' drafts/judging run while we wait
+  if (!am_exec) {
+    std::unique_lock<std::mutex> lk(g_vr.mu);
+    for (;;) {
+      if (req.done) break;
+      if (!g_vr.executing) {
+        // The round completed without us (a peer left its loop), or the wait
+        // window elapsed: run what we have instead of waiting forever.
+        if ((int)g_vr.pend.size() >= g_vr.active ||
+            std::chrono::steady_clock::now() - g_vr.first_submit >=
+                std::chrono::milliseconds(g_vr_wait_ms)) {
+          am_exec = g_vr.executing = true;
+          if ((int)g_vr.pend.size() < g_vr.active) g_vr.timeouts++;
+          break;
+        }
+        g_vr.cv.wait_until(lk, g_vr.first_submit +
+                                   std::chrono::milliseconds(g_vr_wait_ms));
+      } else {
+        g_vr.cv.wait(lk);
+      }
+    }
+    lk.unlock();
+  }
+  if (am_exec) vr_execute(m);
+  const uint64_t back = g_turn.acquire();
+  m.bind(tl_slot);
+  if (!req.dropped && req.win_row0 >= 0) {
+    const int P = (int)self.toks->size();
+    // grants that ran between the executor's turn and ours (peers + others)
+    const long between = (long)(back - req.exec_ticket) - 1;
+    if (vr_check_on()) {
+      const auto h = m.vr_rows_hash(req.win_row0, P);
+      static const char* nm[4] = {"d_Rb", "d_grow", "d_csnap", "d_iproj_snap"};
+      std::string bad;
+      for (int k = 0; k < 4; k++)
+        if (h[k] != req.win_hash[k]) bad += std::string(bad.empty() ? "" : ",") + nm[k];
+      if (bad.empty()) {
+        g_vrc_ok++;
+      } else {
+        const long nb = ++g_vrc_bad;
+        fprintf(stderr, "%s [vr-check] slot %d rows [%d,%d) CLOBBERED: %s (%ld grants in between;"
+                        " ok %ld bad %ld)\n",
+                log_ts(), self.slot, req.win_row0, req.win_row0 + P, bad.c_str(), between,
+                g_vrc_ok.load(), nb);
+      }
+      const long tot = g_vrc_ok.load() + g_vrc_bad.load();
+      if (tot % 100 == 0)
+        fprintf(stderr, "%s [vr-check] ok %ld bad %ld\n", log_ts(), g_vrc_ok.load(),
+                g_vrc_bad.load());
+    }
+    if (vr_restore_on() && req.saved) {
+      m.vr_rows_load(self.slot, req.win_row0, P);
+      g_vrc_restored++;
+    }
+  }
+  borrow_abort_check();
+  return !req.dropped;
+}
+
+// ---- D2-S3c: draft rendezvous pool (DraftPool) ----------------------------
+// Same rendezvous shape as the verify pool above: spec workers reach their
+// draft burst holding the GPU turn, submit the round (slot, gamma, tok0),
+// hand the turn over and wait; the last submitter (or a waiter whose window
+// elapsed) becomes the executor and runs ONE batched cross-slot draft for
+// the round (GpuModel::mtp_draft_batch, bit-identical to the serial per-slot
+// mtp_step bursts). Membership mirrors the verify pool: spec_loop joins at
+// the serve call site (DrActive), spec_loop_chain joins per loop and its
+// ngram rounds excuse themselves per round (they never submit).
+struct DrReq {
+  int slot;
+  int g;
+  int tok0;
+  int* drafts;                 // worker stack; room for g ints
+  bool done = false;
+  bool dropped = false;        // abort/guard refusal -> worker serial rerun
+};
+struct DraftPool {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::vector<DrReq*> pend;    // current round's submissions
+  int active = 0;              // workers able to submit this round (under mu)
+  bool executing = false;
+  std::chrono::steady_clock::time_point first_submit;
+  long batches = 0, solo = 0, timeouts = 0, fallbacks = 0;
+  long hist[9] = {};           // batch-size (segments) histogram
+};
+static DraftPool g_dr;
+static int g_dr_wait_ms = 25;  // QWENOX_DR_WAIT_MS
+
+static void dr_round_enter() {
+  std::lock_guard<std::mutex> lk(g_dr.mu);
+  g_dr.active++;
+}
+static void dr_round_exit() {
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    g_dr.active--;
+  }
+  g_dr.cv.notify_all();  // the round may now be complete without us
+}
+// Loop-scope membership at the spec_loop call site. on=false when this
+// worker can never submit (GpuModel::dr_worker_ok): it must not be counted,
+// else the all-arrived trigger waits for it until every timeout.
+struct DrActive {
+  bool on;
+  explicit DrActive(bool on) : on(on) { if (on) dr_round_enter(); }
+  ~DrActive() { if (on) dr_round_exit(); }
+};
+
+// Executor half. Runs on the promoting worker's thread; acquires the GPU
+// turn (FIFO behind the peers, so their rounds land first), runs the batched
+// draft, and wakes everyone. Call with the turn NOT held; returns with it
+// released again.
+static void dr_execute(GpuModel& m) {
+  tl_turn_tag = TT_DR;
+  g_turn.acquire();
+  m.bind(tl_slot);
+  std::vector<DrReq*> mine;
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    mine.swap(g_dr.pend);
+  }
+  std::vector<GpuModel::DrSeg> segs;
+  for (DrReq* r : mine) {
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      if (g_slots[(size_t)r->slot].abort) { r->dropped = true; continue; }
+    }
+    segs.push_back(GpuModel::DrSeg{r->slot, r->g, r->tok0, r->drafts});
+  }
+  // Guard refusal (incl. a borrow window being up: mtp_draft_batch rejects
+  // ws_lent_) -> every worker re-runs its own serial burst.
+  if (!segs.empty() && !m.mtp_draft_batch(segs.data(), (int)segs.size())) {
+    g_dr.fallbacks++;
+    for (DrReq* r : mine) r->dropped = true;
+  }
+  static const bool vr_dbg = getenv("QWENOX_VR_DBG") != nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    for (DrReq* r : mine) r->done = true;
+    g_dr.executing = false;
+    g_dr.batches++;
+    g_dr.hist[std::min(segs.size(), (size_t)8)]++;
+    if (segs.size() <= 1) g_dr.solo++;
+    if (vr_dbg)
+      fprintf(stderr, "%s [dr] batch: %zu segs (batches %ld, solo %ld,"
+                      " timeouts %ld, fallbacks %ld)\n",
+              log_ts(), segs.size(), g_dr.batches, g_dr.solo, g_dr.timeouts,
+              g_dr.fallbacks);
+  }
+  g_dr.cv.notify_all();
+  g_turn.release();
+  tl_turn_tag = TT_WORKER;
+}
+
+// Worker half (GpuModel::dr_pool_fn), called from the spec loops holding the
+// GPU turn, checkpoint saved. Returns true with drafts filled, or false when
+// the pool could not run this round (caller runs the serial draft burst).
+static bool dr_pool(GpuModel& m, const GpuModel::DrSeg& self) {
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    if (g_dr.active <= 1) return false;  // sole decoder: keep the serial path
+  }
+  DrReq req{self.slot, self.g, self.tok0, self.drafts, false, false};
+  bool am_exec = false;
+  {
+    std::lock_guard<std::mutex> lk(g_dr.mu);
+    if (g_dr.pend.empty()) g_dr.first_submit = std::chrono::steady_clock::now();
+    g_dr.pend.push_back(&req);
+    if ((int)g_dr.pend.size() >= g_dr.active && !g_dr.executing)
+      am_exec = g_dr.executing = true;  // everyone is in: run the round
+  }
+  g_turn.release();  // let the peers' rounds run while we wait
+  if (!am_exec) {
+    std::unique_lock<std::mutex> lk(g_dr.mu);
+    for (;;) {
+      if (req.done) break;
+      if (!g_dr.executing) {
+        // The round completed without us (a peer left its loop), or the wait
+        // window elapsed: run what we have instead of waiting forever.
+        if ((int)g_dr.pend.size() >= g_dr.active ||
+            std::chrono::steady_clock::now() - g_dr.first_submit >=
+                std::chrono::milliseconds(g_dr_wait_ms)) {
+          am_exec = g_dr.executing = true;
+          if ((int)g_dr.pend.size() < g_dr.active) g_dr.timeouts++;
+          break;
+        }
+        g_dr.cv.wait_until(lk, g_dr.first_submit +
+                                   std::chrono::milliseconds(g_dr_wait_ms));
+      } else {
+        g_dr.cv.wait(lk);
+      }
+    }
+    lk.unlock();
+  }
+  if (am_exec) dr_execute(m);
   g_turn.acquire();
   m.bind(tl_slot);
   borrow_abort_check();
+  return !req.dropped;
 }
 
 // GpuModel::kv_starve_fn (pool dry after rckpt eviction), GPU owner only.
@@ -2146,6 +2667,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
   }
   tl_slot = s;
   m.bind(s);
+  m.pf_end = 0;  // not ingesting a prompt yet (a thrown earlier request may have left it)
   // Leaving: the slot turns idle while this worker still owns the GPU, so a
   // starving peer never sees a finished request as busy.
   struct Lease {
@@ -2269,6 +2791,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // Ngram proposals are request-local. Clear learned suffixes so a
     // previous request cannot collide with this prompt's hash history.
     if (g.drafter == 3 || g.drafter == 4) m.ngram.reset();
+    m.ng_reset();  // gate + chunk level are per request too (reproducibility)
     // Vision requests expand their grids in-engine (validated against the
     // prompt's image token runs); plain requests drop stale mrope state
     // (a cont turn skips reset_state).
@@ -2447,6 +2970,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // (spec-verify batches never see it armed). prog_base accumulates
     // across the kvsnap cut segments inside prefill_chunk.
     m.prog_total = (int)(g.ids.size() - done_upto);
+    m.pf_end = (int)g.ids.size();  // prompt ingest: scheduling sees what is left
     m.prog_base = 0;
     m.prog_last_est = 0;
     m.prog_req = g.req;
@@ -2523,6 +3047,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       cut_lap("cut-save");
     }
     m.prog_total = 0;
+    m.pf_end = 0;
     m.mtp_tap_capture = false;  // decode/verify must not capture taps
     hist = g.ids;  // prompt fully ingested on both paths
     if (use_spec || chain_mtp) mtp_live = true;  // MTP KV complete & in lockstep
@@ -2672,7 +3197,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           pause_tok = -1;
           if (g.sample)
             m.spec_loop_chain_sample(cur, g.max_tokens - 1, spec_gamma, smp,
-                                     chain_mtp, emit_ng_smp);
+                                     chain_mtp, emit_ng_smp, g.seeded);
           else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng);
           else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
           spec_r += m.last_spec_rounds;
@@ -2720,7 +3245,14 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
               dl_tick();
               return !cancel;
             };
-            m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+            {
+              VrActive vr_act;  // rendezvous membership; every exit counts
+              // D2-S3c: draft rendezvous membership, same scope and exit
+              // discipline. dr_worker_ok is the submit predicate too, so the
+              // count never includes a worker that cannot submit.
+              DrActive dr_act(m.dr_worker_ok());
+              m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+            }
           }
           spec_r += m.last_spec_rounds;
           spec_c += m.last_spec_commit;
@@ -2830,6 +3362,19 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                     : 0.0,
                 use_chain ? (chain_mtp ? "chain" : "ngram")
                           : (use_ngram ? "ngram" : "mtp"));
+      }
+      // D2-S2: rendezvous pool snapshot + batch-size histogram (histogram
+      // buckets = segments per batch, 8 = 8+).
+      if (m.vseg_pool_fn && g_vr.batches) {
+        std::lock_guard<std::mutex> lk(g_vr.mu);
+        fprintf(stderr,
+                "%s [vr] batches=%ld multi=%ld solo=%ld timeouts=%ld "
+                "fallbacks=%ld | segs 1:%ld 2:%ld 3:%ld 4:%ld 5:%ld 6:%ld "
+                "7:%ld 8+:%ld\n",
+                log_ts(), g_vr.batches, g_vr.batches - g_vr.solo, g_vr.solo,
+                g_vr.timeouts, g_vr.fallbacks, g_vr.hist[1], g_vr.hist[2],
+                g_vr.hist[3], g_vr.hist[4], g_vr.hist[5], g_vr.hist[6],
+                g_vr.hist[7], g_vr.hist[8]);
       }
     }
     perfsnap::write_idle();  // tooltip 下一轮轮询即回归纯地址
@@ -3108,6 +3653,44 @@ static int run(GpuModel& m, const std::string& host, int port) {
     m.borrow_query_fn = &borrow_query;
     m.borrow_fn = &borrow_turn;
     m.borrow_skip_fn = &borrow_skip;
+    m.heavy_gate_fn = &heavy_gate;
+    fprintf(stderr, "qwenox: prefill scheduling: lend %s, between prompts %s "
+                    "(QWENOX_CONC_LEND_LIGHT_ONLY / QWENOX_PREFILL_SRPT)\n",
+            lend_light_only() ? "light-only" : "any waiter",
+            prefill_srpt() ? "shortest-remaining-first" : "alternate per chunk");
+    // D2-S2a verify rendezvous: opt out with QWENOX_NO_VR=1 (serial
+    // single-segment verify, the pre-S2 behavior). QWENOX_VR_WAIT_MS bounds
+    // how long a submitter waits for stragglers before running the round.
+    static const bool no_vr =
+        getenv("QWENOX_NO_VR") && !GpuModel::env_zero("QWENOX_NO_VR");
+    if (!no_vr) {
+      m.vseg_pool_fn = &vseg_pool;
+      m.vseg_active_fn = &vseg_active;
+      // D2-S2b/c: chain loops join the pool per loop (ngram rounds excuse
+      // themselves — they never submit and would stall the trigger).
+      m.vseg_round_enter_fn = &vseg_round_enter;
+      m.vseg_round_exit_fn = &vseg_round_exit;
+    }
+    // D2-S3c draft rendezvous: opt out with QWENOX_NO_DR=1 (serial per-slot
+    // draft bursts, the pre-S3c behavior). QWENOX_DR_WAIT_MS bounds how long
+    // a submitter waits for stragglers before running the round itself.
+    static const bool no_dr =
+        getenv("QWENOX_NO_DR") && !GpuModel::env_zero("QWENOX_NO_DR");
+    if (!no_dr) {
+      m.dr_pool_fn = &dr_pool;
+      m.dr_round_enter_fn = &dr_round_enter;
+      m.dr_round_exit_fn = &dr_round_exit;
+    }
+    if (const char* v = getenv("QWENOX_DR_WAIT_MS")) {
+      g_dr_wait_ms = atoi(v);
+      if (g_dr_wait_ms < 1) g_dr_wait_ms = 1;
+      if (g_dr_wait_ms > 5000) g_dr_wait_ms = 5000;
+    }
+    if (const char* v = getenv("QWENOX_VR_WAIT_MS")) {
+      g_vr_wait_ms = atoi(v);
+      if (g_vr_wait_ms < 1) g_vr_wait_ms = 1;
+      if (g_vr_wait_ms > 5000) g_vr_wait_ms = 5000;
+    }
   }
   rckpt::prewarm(m.kv_nl > g_cfg.layers / 4);  // pinned checkpoint pool, background
   fprintf(stderr, "serve: listening on %s:%d (maxctx %d, %d slot%s)\n", host.c_str(), port,

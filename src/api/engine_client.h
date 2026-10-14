@@ -35,6 +35,7 @@ struct GenParams {
     float top_p = 0.0f;
     float min_p = 0.0f;
     unsigned long long seed = 0;         // REQUIRED with SAMPLE
+    bool seeded = false;                 // seed came from the client (SEEDED)
     float presence = 0.0f;
     float frequency = 0.0f;
     std::vector<std::pair<int, float>> bias;   // <= 20480, tid < 248320

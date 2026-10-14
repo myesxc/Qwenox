@@ -21,6 +21,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -702,6 +703,7 @@ struct GenSpec {
     float top_p = 0.95f;
     float min_p = 0.0f;
     unsigned long long seed = 0;
+    bool seeded = false;  // client-supplied seed (engine SEEDED flag)
     float presence = 0.0f;
     float frequency = 0.0f;
     std::vector<std::pair<int, float>> bias;
@@ -788,6 +790,7 @@ GenOutcome run_generation(GenSpec& spec,
     p.top_p = spec.top_p;
     p.min_p = spec.min_p;
     p.seed = spec.seed;
+    p.seeded = spec.seeded;
     p.presence = spec.presence;
     p.frequency = spec.frequency;
     p.bias = spec.bias;
@@ -1066,6 +1069,7 @@ void apply_sampling(const json& body, GenSpec* spec) {
         } else {
             http::fail(400, "seed must be an integer or decimal integer string");
         }
+        spec->seeded = true;
     } else {
         static thread_local std::mt19937_64 rng{std::random_device{}()};
         spec->seed = rng();  // the engine's RNG is counter-based: a seed is required
@@ -1415,7 +1419,7 @@ void handle_overrides_post(const http::Request& q, http::Response* r, http::Stre
 // 版本选择持久化为注释行 "# start_win: weights=v1|v2|gguf"；无标记时按
 // NGRAM_FILE 是否跟随 MODEL_FILE 推断 V1/V2（GGUF 只能来自标记）。
 // 保存语义：V1 强制 NGRAM_FILE=$MODEL_FILE；V2 强制 OVERLAY_FILE 置空；
-// GGUF 只写 GGUF_*（Windows 启停只吃 hgn 键，GGUF 配置供 Linux 脚本用）。
+// GGUF 只写 GGUF_*（Windows 启停按标记 weights=gguf 改用 GGUF_* 键，enginesup::start）。
 
 const char* kWeightsMarker = "# start_win: weights=";
 
@@ -1680,6 +1684,7 @@ void handle_engine_start(const http::Request& q, http::Response* r, http::Stream
         std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
         conf = g_svc_conf;
     }
+    conf[enginesup::kWeightsVerKey] = svcconf::conf_marker(g_conf_path, kWeightsMarker);
     std::string err;
     if (!svcconf::validate_conf(conf, &err)) http::fail(400, err);
     if (!enginesup::start(g_conf_root, conf, &err)) http::fail(400, err);
@@ -1986,7 +1991,8 @@ void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
-// GET /power — APU 功耗瞬时值（Windows ADL PMLog / Linux amdgpu hwmon），
+// GET /power — APU 功耗与温度瞬时值（Windows ADL PMLog / Linux amdgpu hwmon +
+// k10temp），
 // 读不到的字段为 null，完全不可用时 available=false。
 void handle_power(const http::Request&, http::Response* r, http::Stream*) {
     const power::Reading p = power::read();
@@ -1998,6 +2004,16 @@ void handle_power(const http::Request&, http::Response* r, http::Stream*) {
     else j["gfx_watts"] = nullptr;
     if (p.cpu_watts >= 0) j["cpu_watts"] = p.cpu_watts;
     else j["cpu_watts"] = nullptr;
+    // 温度（°C），与功耗同一次快照；读不到的为 null。
+    j["temp_available"] = p.temp_available;
+    const auto put_temp = [&j](const char* k, int v) {
+        if (v >= 0) j[k] = v;
+        else j[k] = nullptr;
+    };
+    put_temp("gpu_temp_c", p.gpu_temp_c);
+    put_temp("gpu_hotspot_c", p.gpu_hotspot_c);
+    put_temp("cpu_temp_c", p.cpu_temp_c);
+    put_temp("soc_temp_c", p.soc_temp_c);
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
@@ -3354,6 +3370,11 @@ bool probe_engine() {
         fprintf(stderr, "qwenox-api: engine INFO unavailable (%s); continuing with "
                         "ctx=%d\n", err.c_str(), g_cfg.context);
     }
+    // No usable INFO: still build the g_slots (= 1) default connection so a
+    // request that lands before reprobe_engine_loop widens the pool finds a
+    // client (SlotGuard pops g_pool_free; an empty pool crashed the API --
+    // 10-13, API started before the engine, first request beat the re-probe).
+    if (!ok) apply_engine_info(EngineInfo{});
     log_slots();
     return ok;
 }
@@ -3514,7 +3535,8 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
             _chdir(g_conf_root.c_str());
 #else
-            chdir(g_conf_root.c_str());
+            if (chdir(g_conf_root.c_str()) != 0)
+                fprintf(stderr, "[warn] chdir(%s) 失败: %s\n", g_conf_root.c_str(), strerror(errno));
 #endif
         }
         svcconf::load_conf(path, &g_svc_conf);
@@ -3561,7 +3583,7 @@ int main(int argc, char** argv) {
     if (g_tray_mode) {
         // 防多开（--console 不受限：脚本场景由端口占用兜底）。必须在 listen 之前：
         // Windows 的 SO_REUSEADDR 允许后启动的实例抢绑同一端口。句柄不关，退出回收。
-        CreateMutexW(nullptr, FALSE, L"Local\\gfx1151-qwenox-api");
+        CreateMutexW(nullptr, FALSE, L"Local\\Qwenox-api");
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
             mb_qwenox("Qwenox is already running (check the tray icon in the "
                       "taskbar corner, possibly under the ^ overflow).\n"
@@ -3672,7 +3694,9 @@ int main(int argc, char** argv) {
         hooks.api_log = g_api_log_abs;
         hooks.conf_snapshot = [] {
             std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
-            return g_svc_conf;
+            svcconf::Conf c = g_svc_conf;
+            c[enginesup::kWeightsVerKey] = svcconf::conf_marker(g_conf_path, kWeightsMarker);
+            return c;
         };
         hooks.engine_endpoint = [] {
             return std::make_pair(eff_engine_host(), eff_engine_port());

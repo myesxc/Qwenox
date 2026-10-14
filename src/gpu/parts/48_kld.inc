@@ -162,8 +162,9 @@ static int run(GpuModel& m, std::vector<int> tokens, const Opts& o) {
     n_chunk = (int)(tokens.size() / n_ctx);
   }
   if (o.chunks >= 0) n_chunk = std::min(n_chunk, o.chunks);
-  // n_ctx > maxbatch（如 QWENOX_PREFILL_CHUNK=8192 跑 16K）：按生产 prefill_batch 的方式分段，
-  // logits 只能读最后一段的行，所以被统计的后半段必须整段落在最后一段里。
+  // n_ctx > maxbatch（如 QWENOX_PREFILL_CHUNK=8192 跑 16K，或 =24 让 dense 投影走小 P 的
+  // gemv/WMMA 路径）：按生产 prefill_batch 的方式分段，每段结束后读出该段里落在被统计后半段
+  // 的行（d_xb 只保留当前段）。被统计段整段落在最后一段时与旧版只读最后一段完全相同。
   int last = 0;
   for (int off = 0; off < (int)n_ctx;) {
     int rem = (int)n_ctx - off, n = std::min(m.maxbatch, rem);
@@ -171,15 +172,15 @@ static int run(GpuModel& m, std::vector<int> tokens, const Opts& o) {
     last = off;
     off += n;
   }
-  if (n_ctx < 16 || (int)n_ctx > m.maxctx || (int)n_ctx / 2 < last || n_chunk < 1) {
-    fprintf(stderr, "kld: need n_ctx in [16, maxctx=%d] (got %u), its scored half inside the "
-            "last prefill chunk (maxbatch=%d, last chunk starts at %d) and >= 1 chunk\n",
-            m.maxctx, n_ctx, m.maxbatch, last);
+  if (n_ctx < 16 || (int)n_ctx > m.maxctx || n_chunk < 1) {
+    fprintf(stderr, "kld: need n_ctx in [16, maxctx=%d] (got %u) and >= 1 chunk\n", m.maxctx,
+            n_ctx);
     return 2;
   }
   if (last > 0)
-    fprintf(stderr, "kld: n_ctx %u > maxbatch %d -> multi-chunk prefill, last chunk at %d\n",
-            n_ctx, m.maxbatch, last);
+    fprintf(stderr, "kld: n_ctx %u > maxbatch %d -> multi-chunk prefill, last chunk at %d%s\n",
+            n_ctx, m.maxbatch, last,
+            (int)n_ctx / 2 < last ? " (scored rows gathered from several chunks)" : "");
   for (size_t i = 0; i < (size_t)n_ctx * n_chunk; i++) {
     if (tokens[i] < 0 || tokens[i] >= n_vocab) {
       fprintf(stderr, "kld: token %zu out of vocabulary: %d\n", i, tokens[i]);
@@ -199,7 +200,7 @@ static int run(GpuModel& m, std::vector<int> tokens, const Opts& o) {
   const bool cmp = in.is_open();
   fprintf(stderr, "kld: %d chunks x %u ctx, %d scored/chunk, base=%s save=%s\n", n_chunk,
           n_ctx, nrow, cmp ? o.base.c_str() : "-", o.save.empty() ? "-" : o.save.c_str());
-  std::vector<float> logits;
+  std::vector<float> logits, seg;
   std::vector<uint16_t> base((size_t)nrow * nv), saved;
   if (out.is_open()) saved.resize((size_t)nrow * nv);
   std::vector<Row> rows(nrow);
@@ -214,13 +215,18 @@ static int run(GpuModel& m, std::vector<int> tokens, const Opts& o) {
     const int* tk = tokens.data() + (size_t)c * n_ctx;
     // 分段与 prefill_batch 相同；不走 prefill_batch 是因为它段后的 MTP tap ingest 可能复用
     // d_xb，而下面要读最后一段的 d_xb 行（MTP 不影响主模型 logits）。
+    logits.resize((size_t)nrow * n_vocab);
     for (int off = 0; off < (int)n_ctx;) {
       int rem = (int)n_ctx - off, n = std::min(m.maxbatch, rem);
       if (rem > m.maxbatch && rem <= m.maxbatch_cap) n = rem;
       m.prefill_chunk(std::vector<int>(tk + off, tk + off + n), off);
+      const int lo = std::max(off, first), hi = std::min(off + n, first + nrow);
+      if (hi > lo) {
+        m.batch_logits_rows(n, lo - off, hi - lo, seg);
+        std::copy(seg.begin(), seg.end(), logits.begin() + (size_t)(lo - first) * n_vocab);
+      }
       off += n;
     }
-    m.batch_logits_rows((int)n_ctx - last, first - last, nrow, logits);
     const int* tgt = tk + first + 1;
     if (out.is_open()) {
       parallel_rows(nrow, [&](int i) {

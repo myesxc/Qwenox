@@ -328,6 +328,9 @@ std::string build_gen_request(const GenParams& p) {
         // SAMPLE <temp> <top_k> <top_p> <min_p> <seed:u64>
         s += " SAMPLE " + g9(p.temp) + " " + std::to_string(p.top_k) + " " +
              g9(p.top_p) + " " + g9(p.min_p) + " " + std::to_string(p.seed);
+        // SEEDED: client-chosen seed -> reproducible under concurrency (the
+        // engine then fixes its occupancy γ policy; see Model::OccGamma).
+        if (p.seeded) s += " SEEDED";
     }
     if (p.presence != 0.0f || p.frequency != 0.0f)
         s += " PENALTY " + g9(p.presence) + " " + g9(p.frequency);

@@ -29,13 +29,14 @@
 #ifdef _WIN32
 #include "gpu/os_win32.h"
 #endif
+#include "gguf_iq3s_grid.h"
 
 namespace gguf {
 
 enum Type : uint32_t {
   F32 = 0, F16 = 1, Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q8_1 = 9,
   Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, Q8_K = 15,
-  IQ4_NL = 20, IQ4_XS = 23, I8 = 24, I16 = 25, I32 = 26, I64 = 27, F64 = 28, BF16 = 30,
+  IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23, I8 = 24, I16 = 25, I32 = 26, I64 = 27, F64 = 28, BF16 = 30,
 };
 
 // (elements per block, bytes per block); {0,0} = unsupported.
@@ -59,6 +60,7 @@ inline void block_info(uint32_t t, uint32_t& be, uint32_t& bb) {
     case Q5_K: be = 256; bb = 176; return;
     case Q6_K: be = 256; bb = 210; return;
     case IQ4_XS: be = 256; bb = 136; return;
+    case IQ3_S: be = 256; bb = 110; return;
     default: be = 0; bb = 0; return;
   }
 }
@@ -70,6 +72,7 @@ inline const char* type_name(uint32_t t) {
     case Q5_1: return "Q5_1"; case Q8_0: return "Q8_0"; case Q2_K: return "Q2_K";
     case Q3_K: return "Q3_K"; case Q4_K: return "Q4_K"; case Q5_K: return "Q5_K";
     case Q6_K: return "Q6_K"; case IQ4_NL: return "IQ4_NL"; case IQ4_XS: return "IQ4_XS";
+    case IQ3_S: return "IQ3_S";
     case I32: return "I32"; case I64: return "I64";
     default: return "?";
   }
@@ -117,6 +120,10 @@ class File {
     size_t len = 0;
     std::string path;
     int fd = -1;
+    // Windows: the file handle stays open (OVERLAPPED | NO_BUFFERING, like
+    // hgn.h) so the weight loader can ReadFile shard ranges straight into
+    // pinned staging, bypassing the page cache (32 GiB host RAM).
+    void* os_handle = nullptr;
   };
 
   File() = default;
@@ -128,6 +135,11 @@ class File {
     for (auto& m : maps_) {
       if (m.base) munmap((void*)m.base, m.len);
       if (m.fd >= 0) ::close(m.fd);
+    }
+#else
+    for (auto& m : maps_) {
+      if (m.base) UnmapViewOfFile((void*)m.base);
+      if (m.os_handle) CloseHandle((HANDLE)m.os_handle);
     }
 #endif
   }
@@ -181,6 +193,27 @@ class File {
   const std::vector<std::string>& order() const { return order_; }
   const std::unordered_map<std::string, Value>& kvs() const { return kv_; }
   const std::vector<Mapping>& mappings() const { return maps_; }
+
+  // Drop the mapped pages this process has touched from its working set
+  // (Windows; no-op elsewhere). After load every weight lives in the device
+  // arena, but the pages read through the mapping (gguf_map's dense / norm
+  // conversion: ~5 GiB for UD-IQ4_XS) stay resident and show as "in use" in
+  // Task Manager. VirtualUnlock on unlocked pages removes them from the
+  // working set (documented behaviour; it reports ERROR_NOT_LOCKED): they move
+  // to the standby list -- still cached, reclaimable, and soft-faulted back if
+  // touched again (the PLE table is read with ReadFile, not through the map).
+  // Returns the mapped bytes covered.
+  size_t trim_resident() const {
+    size_t n = 0;
+#ifdef _WIN32
+    for (const auto& m : maps_)
+      if (m.base) {
+        VirtualUnlock((LPVOID)m.base, m.len);
+        n += m.len;
+      }
+#endif
+    return n;
+  }
   std::string arch() const { return kv_s("general.architecture"); }
 
  private:
@@ -231,11 +264,26 @@ class File {
     Mapping m;
     m.path = path;
 #ifdef _WIN32
-    struct _stat64 st;
-    if (_stat64(path.c_str(), &st) != 0) throw std::runtime_error("gguf: stat " + path);
-    m.len = (size_t)st.st_size;
-    m.base = (const uint8_t*)os_map_ro(path.c_str(), m.len);
-    if (!m.base) throw std::runtime_error("gguf: map " + path);
+    HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) throw std::runtime_error("gguf: open " + path);
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(fh, &sz)) {
+      CloseHandle(fh);
+      throw std::runtime_error("gguf: GetFileSizeEx " + path);
+    }
+    m.len = (size_t)sz.QuadPart;
+    HANDLE mh = CreateFileMappingA(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (mh) {
+      m.base = (const uint8_t*)MapViewOfFile(mh, FILE_MAP_READ, 0, 0, m.len);
+      CloseHandle(mh);
+    }
+    if (!m.base) {
+      CloseHandle(fh);
+      throw std::runtime_error("gguf: map " + path);
+    }
+    m.os_handle = (void*)fh;
 #else
     m.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (m.fd < 0) throw std::runtime_error("gguf: open " + path + ": " + strerror(errno));
@@ -400,6 +448,57 @@ inline void dequant_row(uint32_t t, const uint8_t* src, float* y, uint64_t k) {
         for (int j = 0; j < 16; j++) {
           yy[j] = dl * kv[qs[j] & 0xF];
           yy[j + 16] = dl * kv[qs[j] >> 4];
+        }
+      }
+    }
+    return;
+  }
+  if (t == IQ3_S) {  // 110 B / 256: d, qs[64], qh[8], signs[32], scales[4]
+    static const uint32_t grid[512] = GGUF_IQ3S_GRID_INIT;
+    for (uint64_t b = 0; b < k / 256; b++, src += 110) {
+      uint16_t dh; memcpy(&dh, src, 2);
+      const float d = h2f(dh);
+      const uint8_t* qs = src + 2;
+      const uint8_t* qh = src + 66;
+      const uint8_t* sg = src + 74;
+      const uint8_t* sc = src + 106;
+      float* yy = y + b * 256;
+      for (int ib = 0; ib < 8; ib++) {  // 32-element sub-block: 8 grid entries
+        const float db = d * (float)(1 + 2 * ((sc[ib / 2] >> (4 * (ib & 1))) & 0xF));
+        const uint8_t h = qh[ib];
+        for (int l = 0; l < 4; l++) {
+          const uint32_t g1 = grid[qs[ib * 8 + 2 * l] | ((h << (8 - 2 * l)) & 256)];
+          const uint32_t g2 = grid[qs[ib * 8 + 2 * l + 1] | ((h << (7 - 2 * l)) & 256)];
+          const uint8_t s = sg[ib * 4 + l];
+          for (int j = 0; j < 4; j++) {
+            const float m1 = (float)((g1 >> (8 * j)) & 0xFF), m2 = (float)((g2 >> (8 * j)) & 0xFF);
+            yy[ib * 32 + l * 8 + j] = db * m1 * ((s >> j) & 1 ? -1.f : 1.f);
+            yy[ib * 32 + l * 8 + j + 4] = db * m2 * ((s >> (j + 4)) & 1 ? -1.f : 1.f);
+          }
+        }
+      }
+    }
+    return;
+  }
+  if (t == Q6_K) {  // 210 B / 256: ql[128], qh[64], scales[16] (int8), d
+    for (uint64_t b = 0; b < k / 256; b++, src += 210) {
+      uint16_t dh; memcpy(&dh, src + 208, 2);
+      const float d = h2f(dh);
+      const uint8_t* ql = src;
+      const uint8_t* qh = src + 128;
+      const int8_t* sc = (const int8_t*)(src + 192);
+      float* yy = y + b * 256;
+      for (int n = 0; n < 256; n += 128, yy += 128, ql += 64, qh += 32, sc += 8) {
+        for (int l = 0; l < 32; l++) {
+          const int is = l / 16;
+          const int q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+          const int q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+          const int q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+          const int q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+          yy[l] = d * sc[is] * q1;
+          yy[l + 32] = d * sc[is + 2] * q2;
+          yy[l + 64] = d * sc[is + 4] * q3;
+          yy[l + 96] = d * sc[is + 6] * q4;
         }
       }
     }

@@ -356,6 +356,44 @@ struct PleWin {
       }
     }
   }
+
+  // Split form of run() for one small batch (n <= DEPTH): issue() posts every
+  // read now, wait_all() collects the n completions later. Same bytes as
+  // run(). Lets the caller post the reads, enqueue GPU work, then wait, with
+  // no helper thread (10-12: spawning threads per verify cost ~2 ms under
+  // serving load). One batch in flight at a time.
+  std::vector<OVERLAPPED> b_ovs;
+  size_t b_n = 0;
+  void issue(const uint64_t* addrs, uint8_t* staging, uint64_t table_va, size_t n) {
+    b_ovs.assign(n, OVERLAPPED{});  // never reallocated while reads are pending
+    for (size_t i = 0; i < n; i++) {
+      OVERLAPPED* ov = &b_ovs[i];
+      const uint64_t off = g_ple_foff + (addrs[i] - table_va);
+      ov->Offset = (DWORD)(off & 0xffffffffu);
+      ov->OffsetHigh = (DWORD)(off >> 32);
+      BOOL r = ReadFile(fh, staging + i * g_ple_rb, g_ple_rb, nullptr, ov);
+      if (!r && GetLastError() != ERROR_IO_PENDING) {
+        fprintf(stderr, "ple_win: ReadFile row %zu failed: %lu\n", i, GetLastError());
+        abort();
+      }
+    }
+    b_n = n;
+  }
+  void wait_all() {
+    for (size_t done = 0; done < b_n; done++) {
+      DWORD got = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
+      if (!okr || got != g_ple_rb) {
+        fprintf(stderr, "ple_win: read completion failed (row=%zd, got=%lu, err=%lu)\n",
+                pov ? (ptrdiff_t)(pov - b_ovs.data()) : (ptrdiff_t)-1, (unsigned long)got,
+                (unsigned long)GetLastError());
+        abort();
+      }
+    }
+    b_n = 0;
+  }
 };
 
 static PleWin g_ple_win;  // per-token reads (decode / NOSORT path): never shared with pumps
@@ -931,6 +969,32 @@ __global__ void k_moe_tiles(const int* eoff, MoeTile* tiles, int* total, int exp
   Scan().exclusive_scan(count, begin, 0, storage);
   if (e == 511) *total = begin + count;
   for (int j = 0; j < count; j++) tiles[begin + j] = {e, first + j * cap, min(cap, ne - j * cap)};
+}
+
+// Hybrid MoE tiling: each expert's rows become full 128-slot super-tiles (list
+// B, BN=128 kernels); a remainder of 1..64 rows goes to list A (one BN=64 tile,
+// higher occupancy, half the activation staging), a remainder of 65..127 rows
+// stays a B tile. Every (slot, row) is still computed by exactly one tile with
+// the baseline K order, so outputs equal the cap-64 / cap-128 tilings bit for bit.
+__global__ void k_moe_tiles_hyb(const int* eoff, MoeTile* tb, int* nb, MoeTile* ta, int* na,
+                                int experts) {
+  using Scan = rocprim::block_scan<int, 512>;
+  __shared__ Scan::storage_type storage;
+  const int e = threadIdx.x;
+  const int first = e < experts ? eoff[e] : 0;
+  const int ne = e < experts ? eoff[e + 1] - first : 0;
+  const int full = ne / 128, rem = ne - full * 128;
+  const int cb = full + (rem > 64 ? 1 : 0), ca = (rem > 0 && rem <= 64) ? 1 : 0;
+  int bb, ba;
+  Scan().exclusive_scan(cb, bb, 0, storage);
+  __syncthreads();
+  Scan().exclusive_scan(ca, ba, 0, storage);
+  if (e == 511) {
+    *nb = bb + cb;
+    *na = ba + ca;
+  }
+  for (int j = 0; j < cb; j++) tb[bb + j] = {e, first + j * 128, min(128, ne - j * 128)};
+  if (ca) ta[ba] = {e, first + full * 128, rem};
 }
 
 struct GpuMoeRouting {

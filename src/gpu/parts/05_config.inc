@@ -28,4 +28,10 @@ static hipStream_t g_str = nullptr;  // capture stream during graph build, else 
 static std::atomic<int> g_borrow_light{0};
 
 static bool is_qsa(int layer) { return layer % 4 == 3; }
+// QWENOX_TURN_PROF diagnostics fed by the batched verify (40_model.inc
+// prefill_chunk_vseg), printed with the [turnprof] line (51_host_cfg.inc).
+static double g_vseg_ple_ms = 0;  // host time in the per-segment PLE gathers
+static double g_vseg_pleh_ms = 0;  // PLE gather spawn -> done (batched verify)
+static long g_vseg_rows = 0, g_vseg_calls = 0;
+static double g_vseg_enq_ms = 0;  // host enqueue time of batched verifies
 
