@@ -220,6 +220,45 @@ int main(int argc, char** argv) {
               std::count(default_ids.begin(), default_ids.end(), 248056) == 1,
           "default-encode-keeps-pad");
 
+    // Every media marker a message mentions literally is ordinary text; only
+    // the markers inside a template-placed span stay added tokens. The wrapper
+    // text keeps them apart so one occurrence cannot stand in for another.
+    const std::vector<int> marker_ids(vision::placeholder_marker_ids().begin(),
+                                      vision::placeholder_marker_ids().end());
+    const std::string literal_markers =
+        "vision start <|vision_start|> pad <|vision_pad|> end <|vision_end|> "
+        "video <|video_pad|> audio <|audio_start|><|audio_pad|><|audio_end|> "
+        "quote " + span + " blank";
+    std::vector<int> literal_ids;
+    error.clear();
+    check(vision::encode_prompt(literal_markers, tokenizer, {}, {}, &literal_ids, &error),
+          "literal-markers-text", error);
+    for (int id : marker_ids) {
+        check(std::count(literal_ids.begin(), literal_ids.end(), id) == 0,
+              "literal-marker-text id=" + std::to_string(id));
+    }
+    const std::vector<int> literal_text_ids =
+        tokenizer.encode(literal_markers, false, &vision::placeholder_marker_ids());
+    for (int id : marker_ids) {
+        check(std::count(literal_text_ids.begin(), literal_text_ids.end(), id) == 0,
+              "literal-marker-text-path id=" + std::to_string(id));
+    }
+
+    // Mixed: the template span keeps exactly one vision_start/vision_end pair
+    // (the model was trained with those), the literal mention adds none.
+    const std::string mixed = "literal <|vision_start|><|vision_end|> then " + span + " end";
+    const std::vector<size_t> mixed_offsets = span_offsets(mixed);
+    check(mixed_offsets.size() == 1, "mixed-span-offset-count");
+    std::vector<int> mixed_ids;
+    error.clear();
+    check(vision::encode_prompt(mixed, tokenizer, frames, mixed_offsets, &mixed_ids, &error),
+          "mixed-accepted", error);
+    check(std::count(mixed_ids.begin(), mixed_ids.end(), 248053) == 1 &&
+              std::count(mixed_ids.begin(), mixed_ids.end(), 248054) == 1,
+          "mixed-template-markers-kept");
+    check(std::count(mixed_ids.begin(), mixed_ids.end(), 248056) == placeholder.pad_tokens(),
+          "mixed-template-pads");
+
     std::puts("RESULT PASS");
     return 0;
 }

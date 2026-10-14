@@ -148,6 +148,24 @@ def serve_connection(conn):
             n_ids = int(fields[n_ids_at])
             ids = [int(v) for v in fields[n_ids_at + 1:n_ids_at + 1 + n_ids]]
 
+            # What the front-end actually put on the wire, for tests that check
+            # the encoding (ids) and the sampler fields (SAMPLE/BIAS) it sends.
+            bias = []
+            if "BIAS" in fields:
+                at = fields.index("BIAS")
+                count = int(fields[at + 1])
+                values = fields[at + 2:at + 2 + count * 2]
+                bias = [[int(values[i]), float(values[i + 1])]
+                        for i in range(0, len(values), 2)]
+            with TRACE_LOCK:
+                TRACE.append({"req": req, "kind": "gen", "ids": ids,
+                              "eos": [int(v) for v in fields[4:4 + n_eos]],
+                              "sample": "SAMPLE" in fields, "bias": bias,
+                              "cancel": 0, "tokens": 0, "done": False,
+                              "drafter": fields[n_ids_at + 1 + n_ids]
+                              if len(fields) > n_ids_at + 1 + n_ids and
+                              fields[n_ids_at + 1 + n_ids].lstrip("-").isdigit() else None})
+
             grids = []
             if "MROPE" in fields:
                 at = fields.index("MROPE")

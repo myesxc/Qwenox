@@ -272,6 +272,33 @@ structural added token（vision/audio 标记）在提示里出现的次数并打
 **验证清单**：`build_win.sh test`（ktest 354/354）+ `vision_test` + `toolparse_test` + A3 新断言；
 生产观察：`no live prefix` 出现率、结束原因分布（`| done`/`| length`）、"答案在标记处中断"的复现次数。
 
+### 10.1 A / A′ 已实施（2026-10-15）
+
+- **单一来源**：`vision::placeholder_marker_ids()`（`vision.h`/`vision.cpp`）=
+  {248053,248054,248055,248056,248057,248070,248071,248076}，三处共用：① `vision.cpp`
+  的 `encode_prompt` 里"落在模板 span 之外"的标记改为按普通文本重编（模板放置的那一对
+  `vision_start/vision_end` 保持 special，真图片不受影响）；② `main.cpp` 纯文本路径
+  （原 `kTextNoPads`）；③ `TokenCache::cut` 新增钳制：缓存条目里**任何**位置出现这些
+  added token 就不再复用（走到该 id 之前），避免复用把 special 形态带回提示。
+- **A′**：`run_generation` 在请求未显式给 bias 时，对 8 个标记 id 追加 −1e4 的默认偏置
+  （客户端显式 bias 优先；`QWENOX_API_MARKER_BIAS=<v>` 覆盖、`0` 关闭）。**只对 sampled
+  请求生效**——引擎把"没有 SAMPLE 却带 BIAS"的 GEN 行判为 reject（协议规定），greedy
+  请求加了反而会让请求失败；greedy 侧要覆盖需要引擎内建禁表（并入 C 项）。
+- **验证**（都在 Windows 侧跑过）：
+  - `vision_test`（`-Wall -Wextra -Werror` 零警告）：新增"8 个标记字面串在文本路径与
+    tokenizer 路径都不产生 added token"、"mixed 用例里模板 span 恰好保留 1 对
+    vision_start/vision_end + pad_tokens 个 image_pad"等，全部 PASS。
+  - `tools/api_regression_test.py`（对 `tools/api_fake_engine.py`）RESULT PASS——原有前端
+    行为无回归。
+  - 新 `tools/api_marker_verify.py` RESULT PASS：直接查引擎收到的 GEN 行——含标记字面串的
+    请求 ids 里没有任何标记 id、标记以字节级 token 出现；sampled 请求带 8 个 id 的
+    −10000 BIAS、greedy 不带 BIAS、客户端自带的 `logit_bias` 不被覆盖也不重复；并**构造
+    一条把标记存成 248053 的 tcache 条目**重启 API 验证钳制：复用只到标记之前
+    （日志 `tcache: reused 1 ids (12 of 91 bytes)`，去掉钳制时本可复用整段 18 ids 并
+    把 248053 带回）。
+  - 产物已就地更新：`build/qwenox-win.exe`（旧版备份 `build/qwenox-win.exe.bak-20261015-preA`）。
+- **仍待**：B（判定投机路径是否贡献）与 C/D；greedy 请求的标记禁表（引擎侧）。
+
 ## 已完成（2026-10-12）
 - SSD 慢速期归因（10-13 更正为盘固件后台行为，非热）+ PLE 读改回缓冲默认（commit bae0eae，已部署）：见第 4 项。
 - kvsnap 检查点去重（commit 6fea337，已部署）：chat/responses 回合不再写终态 SSD 检查点。
