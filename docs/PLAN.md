@@ -149,6 +149,47 @@ chunk 8–11 变慢就是它）。小增量撞上慢速期：1747 token 从 0.3 
 未能复现，疑与默认开启的 dense WMMA（split-K/原子顺序）在近似平局处翻转有关，待用作者的
 conc_diverge 工具复核）。
 
+## 9. 客户端"输出被截断 / 回合退化" —— 已归因（2026-10-14 深夜）
+
+**结论：引擎没有截断，是 API 把"输出在 tool call 中途结束"错标成 `finish_reason="length"`。**
+
+**证据链**（客户端 DSH 会话 `session-40b7cd02` 的 jsonl + 本机 API/引擎日志按 responseId 对齐）：
+回合 2 第 1 步在客户端记录 `stopReason: "length"`（客户端据 OpenAII finish_reason 判定），
+而同一 responseId `chatcmpl-cc346495cc06bb88941da293` 在本机日志是
+`REQ 63 end finish=stop prompt=45890 gen=412`——引擎侧既没到长度上限也没出错。
+chat/completions 两条路径里唯一能把"引擎 reason=stop"变成"length"的代码就是
+`parser.has_partial_call()`：`toolparse.cpp:779` 在输出流结束（`finish()`）时仍停在
+tool-call 块内（`State::Broken`，或 final 时不在 `State::Text`）= 输出中途断了/JSON 参数
+不完整 → `partial_=true`。
+
+**客户端因此看到的连锁反应**：finish_reason=length → DSH 显示"已达到输出 token 上限，
+回答被截断，已有输出保留在对话中，发送继续可让模型接着输出"（用户困惑"才用 50 多 K"）
+→ 用户/客户端发"继续"补写，可那个回合其实已经自然结束 → 模型只能输出填充语
+（实测该步正文为空，reasoning 只有 "I need to investigate this further. Let me check
+the details."）→ DSH 的退化检测触发 → 抄进会话的就是那句
+`❌ [ACP] stream error: the turn degenerated again after the continuation nudge`。
+
+**同时确认引擎侧无辜**（同一个会话逐请求核对）：回合 1 的 13 个步骤各自
+`out=437/230/292/264/469/674/472/123/179/391/733/203/274`，与引擎
+`REQ 48/49/50/51/52/53/54/55/56/57/59/60/62` 的 `gen=` 完全一致——模型和引擎都按
+客户端的每一步如数输出，没有丢 token、没有重启、没有 502。合并版与合并前的生产
+（`logs/engine-api-20261013-195257.log`）在 30–49K 上下文的解码速度同为 ~30 tok/s；
+MTP acceptance 从 ~0.78 降到 ~0.40 是上游自适应 γ（γ 3–5、commit/round 2.7–3.6）的口径
+变化，不是质量或性能回归（每轮耗时 84 ms vs 合并前基线 95 ms）。
+
+**修复**：`finish_reason_for()`（`src/api/main.cpp`，两条 chat/completions 路径都接入）：
+只有引擎 `reason=="length"` 才报 `length`；有完整 tool call 仍报 `tool_calls`；
+只有"输出中途断在不完整 tool call 上且没有任何完整调用"才报 `stop`（该不完整调用照旧丢弃），
+并往 stderr 打一行 `chat <id>: output ended inside a tool call ...`，便于以后统计频次。
+`/v1/responses` 路径本来就区分 `incomplete_details.reason = invalid_tool_call`，无需改。
+验证：重新编译的 API 起在 8741（旁路实例，连同一引擎）——无 tools 请求 `finish=stop`、
+带 tools 且模型正常调用时 `finish=tool_calls` 且参数解析正确，均与改前一致。
+
+**另一条本次实测**：20:44–20:45 三个 kvsnap 写盘 11.27 / 18.48 s、随后 5.78 s（此前整段
+会话都是 0.11–0.19 s），检查点目录已 4720 个文件 / 25.6 GB（上限 30 GB）——盘又进了慢速期
+（见第 4 项）。虽与本次截断无关，但期间任何在飞请求都会被拖慢/堵住，值得留意；
+若频繁出现，可考虑把 KVSNAP_MAX_GB 调小或换盘放 `data/kvsnap`。
+
 ## 已完成（2026-10-12）
 - SSD 慢速期归因（10-13 更正为盘固件后台行为，非热）+ PLE 读改回缓冲默认（commit bae0eae，已部署）：见第 4 项。
 - kvsnap 检查点去重（commit 6fea337，已部署）：chat/responses 回合不再写终态 SSD 检查点。

@@ -1137,6 +1137,23 @@ json usage_json(const GenOutcome& o, const std::vector<int>& prompt_ids) {
     return u;
 }
 
+// OpenAI finish_reason for a finished generation. An output that ends inside a
+// tool-call block (broken syntax, or arguments cut short) is the model's own end
+// of turn, not a token-budget cut: reporting it as "length" makes clients
+// announce an output-token limit and nudge a continuation of a turn that had
+// already finished. Only the engine's own "length" says the budget ran out.
+std::string finish_reason_for(const GenOutcome& o, const toolparse::StreamParser& parser,
+                              const std::string& id) {
+    if (o.reason == "length") return "length";
+    if (!parser.calls().empty()) return "tool_calls";
+    if (!parser.has_partial_call()) return o.reason;
+    fprintf(stderr,
+            "chat %s: output ended inside a tool call (engine %s, no budget cut); "
+            "reporting stop and dropping the incomplete call\n",
+            id.c_str(), o.reason.c_str());
+    return "stop";
+}
+
 json logprobs_json(const std::vector<float>& values) {
     json content = json::array();
     for (float value : values) {
@@ -2823,9 +2840,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         j["created"] = created;
         j["model"] = g_cfg.model;
         j["object"] = "chat.completion";
-        const std::string finish = (o.reason == "length" || parser.has_partial_call())
-                                       ? "length"
-                                       : (parser.calls().empty() ? o.reason : "tool_calls");
+        const std::string finish = finish_reason_for(o, parser, id);
         json choice{{"index", 0}, {"finish_reason", finish}, {"message", msg}};
         if (spec.logprobs) choice["logprobs"] = logprobs_json(o.logprobs);
         j["choices"] = json::array({std::move(choice)});
@@ -2888,9 +2903,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         if (!dispatch_tool_events(parser.feed(ct))) return;
     }
     if (!dispatch_tool_events(parser.finish())) return;
-    const std::string finish = (o.reason == "length" || parser.has_partial_call())
-                                   ? "length"
-                                   : (parser.calls().empty() ? o.reason : "tool_calls");
+    const std::string finish = finish_reason_for(o, parser, id);
     send_frame(st, chunk(json::object(), finish.c_str()));
     if (include_usage) {
         json u;
