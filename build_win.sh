@@ -205,7 +205,11 @@ build_test() {
     echo "[编译] build/ktest-win.exe"
     "$HIPCC" "${FLAGS[@]}" -I src/gpu tools/ktest.cu -o build/ktest-win.exe
     echo "[运行] ktest-win（预期末尾 ALL PASS）"
-    (cd build && HIP_PATH="$TR_WIN" ROCM_PATH="$TR_WIN" ./ktest-win.exe)
+    # ktest ri_ 组锁 PMAX=48，而裸进程里 vseg_multi()=false → gemvmr_maxp()
+    # 取单序列最优 24，P>24 的调用被拒、比对读到上一次的旧 dy（34 个 ri_
+    # 假失败）。把门锁到 48，与 harness 的假设一致。
+    (cd build && HIP_PATH="$TR_WIN" ROCM_PATH="$TR_WIN" QWENOX_GEMVMR_MAXP=48 \
+        ./ktest-win.exe)
 }
 
 case "$TARGET" in
