@@ -111,6 +111,33 @@ chunk 8–11 变慢就是它）。小增量撞上慢速期：1747 token 从 0.3 
   （BEX64）；火绒（HipsTray/wsctrlsvc）与 WSL（vmmemWSL 845 MB–1.9 GB）常驻。以上在重启后
   都与正常性能共存，非充分原因。
 
+## 8. PLE IOCP 批次重叠 → 引擎 abort（2026-10-14，2 槽生产复现）
+
+**现象**：合并且 PARALLEL=2 的引擎在第一路 16.6K prefill 到 74% 时，第二路请求被接入另一个
+槽（该槽有 56645 token 活跃序列需要驱逐），6 ms 后引擎退出，日志一行
+`ple_win: read completion failed (row=18446744073709551615, got=160, status=0x0)`。
+
+**机理**（`40_model.inc` 的 `run()` fail-fast：`!pov || slot >= depth || Internal || got < need`
+→ abort；`row=(size_t)-1` 表示完成包的 OVERLAPPED 不属于本批）：**同一 PleWin/IOCP 上有两个
+读批次在飞**，一个回收线程偷到另一个批次的完成包。同类风险有两处（都只在并发下出现）：
+
+1. Windows 上 `PLE_PUMP` 就是 `g_ple_win`，而上游新的 inline 小批量路径
+   （`issue()/wait_all()`，覆盖 decode / spec verify / 合批 verify）挂在它上面；同时
+   **逐 token 直读**路径直接调 `g_ple_win.run(..., 16)`（40_model.inc:2354/2383/6233）。
+   inline 批次按设计会"投完读 → 排 GPU → 再 wait"，在飞窗口很长，另一路（或另一槽）的
+   per-token 读就能踩上。
+2. 本分支的 gather-ahead 链在 **GPU 回合之外**后台聚簇，且不登记进共享的 `ple_fl`
+   飞行体——上游的串行化前提是"链内 gather + 同一时刻一个 flight"，两条都被绕开；
+   `PARALLEL>1` 时链的 pump 读可与另一段的 legacy gather 落在同一批 pump 实例上。
+
+**已做（commit 见下）**：`PARALLEL>1`（`vseg_multi()`）时关掉链式预取
+（启动日志改为 `ple: gather-ahead off (N concurrent slots; QWENOX_PLE_AHEAD_FORCE=1 to override)`），
+单序列保持原行为；这消除了第 2 类（最可能的一次也在 2 槽 + 并发准入时）。
+
+**待办**：第 1 类属上游设计，若 2 槽下仍偶发，应把 inline 路径拆到独立 PleWin（或对其加
+一次性串行），值得在 PR 里与作者讨论。合成复现（2 路长 prefill 交错、2 路长解码、带槽驱逐）
+均未复现，属稀有竞态；`PARALLEL=1`（生产配置）从未出现。
+
 ## 已完成（2026-10-12）
 - SSD 慢速期归因（10-13 更正为盘固件后台行为，非热）+ PLE 读改回缓冲默认（commit bae0eae，已部署）：见第 4 项。
 - kvsnap 检查点去重（commit 6fea337，已部署）：chat/responses 回合不再写终态 SSD 检查点。

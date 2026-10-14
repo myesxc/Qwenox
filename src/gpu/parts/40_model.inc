@@ -996,9 +996,16 @@ struct GpuModel {
         const char* e = getenv("QWENOX_PLE_AHEAD_MB");
         const long budget_mb = e ? atol(e) : 256;
         const size_t chunk_b = (size_t)BP * 2560;
-        ple_ahead_on = budget_mb > 0;
+        // The chain is one global flight (ple_ahead + the shared pump/ple_fl
+        // pools), so it must not run while a second slot may gather at the same
+        // time: with PARALLEL>1 two concurrent prefills herd each other's rows
+        // onto one IOCP and the fail-fast completion check aborts the engine
+        // (2026-10-14: 2-slot crash mid-prefill). Single sequence keeps it.
+        const bool ahead_ok =
+            budget_mb > 0 && (!vseg_multi() || getenv("QWENOX_PLE_AHEAD_FORCE"));
+        ple_ahead_on = ahead_ok;
         int k = 2;
-        if (budget_mb > 0) {
+        if (ahead_ok) {
           k = (int)std::max(2L, std::min(16L, (long)(((size_t)budget_mb << 20) / chunk_b)));
         }
         ple_ring_k = k;
@@ -1020,10 +1027,16 @@ struct GpuModel {
         ple_ring_ev_ok.assign((size_t)k, false);
         for (int i = 0; i < k; i++)
           CK(hipEventCreateWithFlags(&ple_ring_ev[i], hipEventDisableTiming));
-        fprintf(stderr,
-                "ple: gather-ahead ring %d slots (%.0f MB host pinned added; "
-                "QWENOX_PLE_AHEAD_MB=%ld)\n",
-                k, added / 1048576.0, budget_mb);
+        if (ahead_ok)
+          fprintf(stderr,
+                  "ple: gather-ahead ring %d slots (%.0f MB host pinned added; "
+                  "QWENOX_PLE_AHEAD_MB=%ld)\n",
+                  k, added / 1048576.0, budget_mb);
+        else if (budget_mb > 0)
+          fprintf(stderr,
+                  "ple: gather-ahead off (%d concurrent slots; "
+                  "QWENOX_PLE_AHEAD_FORCE=1 to override)\n",
+                  eff_parallel());
       }
       DALLOC(&d_wbf16, (size_t)64 << 20);  // fits q_proj 12288x2560 bf16
       DALLOC(&d_xbf16, BP * 10240 * 2);
