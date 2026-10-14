@@ -127,6 +127,19 @@ std::chrono::steady_clock::time_point g_busy_since;  // idle -> busy edge
 // generation_config.json of this checkpoint.
 const std::vector<int> g_eos = {248046, 248044};
 
+// g_slot_mtx must be held. Sized from g_slots, and every caller that can run
+// before the first successful engine probe relies on it: SlotGuard pops
+// g_pool_free, so a request that lands between the engine listening and the
+// re-probe widening the pool would otherwise pop an empty pool and take the
+// whole front-end (and with it the engine it spawned) down. Keep this the only
+// place that grows the pool.
+void ensure_pool_locked() {
+    for (int i = (int)g_pool.size(); i < g_slots; ++i) {
+        g_pool.push_back(std::make_unique<qwenox::EngineClient>());
+        g_pool_free.push_back(g_pool.back().get());
+    }
+}
+
 long long now_unix() {
     return (long long)std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -186,6 +199,7 @@ class SlotGuard {
         }
         if (queued) --g_queued;
         if (g_in_flight++ == 0) g_busy_since = std::chrono::steady_clock::now();
+        ensure_pool_locked();  // never back() an empty pool (see its comment)
         eng_ = g_pool_free.back();  // g_in_flight < g_slots: one is free
         g_pool_free.pop_back();
         acquired_ = true;
@@ -3357,10 +3371,7 @@ void apply_engine_info(const EngineInfo& ei) {
         if (ei.kv_slots > g_slots) g_slots = ei.kv_slots;
         // 池以 g_pool.size() 为基线补齐到 g_slots：启动时为空全量建，
         // 重探测时只补差额；kv_slots=0（老引擎）也保证至少有 1 条连接。
-        for (int i = (int)g_pool.size(); i < g_slots; ++i) {
-            g_pool.push_back(std::make_unique<qwenox::EngineClient>());
-            g_pool_free.push_back(g_pool.back().get());
-        }
+        ensure_pool_locked();
     }
     g_slot_cv.notify_all();  // 排队中的请求重新评估 g_in_flight < g_slots
 }
@@ -3405,6 +3416,16 @@ bool probe_engine() {
     bool ok = false;
     if (!g_ctl.connect(g_cfg.engine_addr, &err, 0.3)) {
         fprintf(stderr, "qwenox-api: engine connect failed: %s\n", err.c_str());
+        // 连不上也要先把池建起来：引擎监听与 re-probe 之间到达的请求会走
+        // SlotGuard，空池会 back() 崩溃并把 API 连带它拉起的引擎一起带走
+        // （10-13 与 10-15 各一次：服务刚起、首个请求抢在 re-probe 前面）。
+        // 连接本身是按需建立的（engine_ready/bring_up），池里放未连接的
+        // client 完全正常：引擎还没起来时请求得到的是 502。
+        {
+            std::lock_guard<std::mutex> lk(g_slot_mtx);
+            ensure_pool_locked();
+        }
+        g_slot_cv.notify_all();
         log_slots();
         return false;
     }

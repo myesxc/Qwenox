@@ -299,6 +299,43 @@ structural added token（vision/audio 标记）在提示里出现的次数并打
   - 产物已就地更新：`build/qwenox-win.exe`（旧版备份 `build/qwenox-win.exe.bak-20261015-preA`）。
 - **仍待**：B（判定投机路径是否贡献）与 C/D；greedy 请求的标记禁表（引擎侧）。
 
+## 11. 502 "acp-proxy failure" + 引擎陪葬：API 空连接池 back() 崩溃（2026-10-15 已修）
+
+**现象**：用户重启服务（API 00:35:38 起、引擎 00:35:48 由 API 拉起）后，00:36 第一个请求
+失败——客户端报 `502 "acp-proxy failure"`（重试延迟 492 ms），引擎进程同时消失。
+API 日志只剩 `engine connect failed` 与两行 `tcache: reused ...`，没有任何 `REQ n start`。
+
+**定位**：Windows 应用程序日志里 `qwenox-win.exe` 异常 0xc0000005（访问违例），
+**故障偏移 0xf1617**。用同源码同参数重建 + `-Xlinker "/MAP:..."`（Git Bash 下要
+`MSYS_NO_PATHCONV=1`，否则 `/MAP` 会被当成路径改写）拿到符号表：该偏移落在
+`run_generation+0x3b7`，故障指令是 `movq -0x8(%rax), %rcx`——即
+`g_pool_free.back()` 在**空池**上的 `*(end()-1)`（main.cpp SlotGuard）。
+引擎不是自己崩的：API 进程退出会连带结束它拉起的引擎（engine_sup 的看守），所以客户端
+看到的是"引擎闪退 + 502"。
+
+**机理**：`probe_engine()` 在 `g_ctl.connect()` 失败时**提前 return**，没有调用
+`apply_engine_info` 建池（10-13 的修复只覆盖了"连上但 INFO 失败"那条路）。于是
+"引擎监听之后、`reprobe_engine_loop` 补池之前"到达的请求，在 SlotGuard 里 pop 空池 → AV。
+用户这次正是"服务刚起就发请求"，引擎冷加载 44 s，请求抢在 re-probe 前面。
+
+**修复**：新增 `ensure_pool_locked()`（唯一的建池点，g_slot_mtx 下），三处调用——
+`apply_engine_info`、`probe_engine` 的 connect 失败路径、以及 `SlotGuard` 取连接前
+（纵深防御）。池里放未连接的 client 是设计内的：连接按需建立（engine_ready/bring_up），
+引擎没起来时请求得到的是 502。
+
+**验证**（都对 18741/18740 的旁路实例、无 GPU）：
+- 旧二进制（`build/qwenox-win.exe.bak-20261015-preA`，即出事那版）：引擎不可达时启动 →
+  第一个请求 **Segmentation fault（exit 139）**、无响应、进程消失——确定性复现；
+- 新二进制：同一场景得到干净的 `502 {"message":"engine not reachable: ..."}`，进程存活；
+- 迟到引擎：先起 API 再起引擎，re-probe 2 s 内补上 INFO，请求 200；
+- `tools/api_regression_test.py`（含 engine-restart/池相关用例）与 `tools/api_marker_verify.py`
+  在最终二进制上 RESULT PASS。
+- 与 §10 的 A/A′ 无关：崩溃代码路径两边完全相同（旧二进制同样崩）。
+
+**运维提示**：启动服务后立刻发第一个请求是安全的（修复后）；若再遇到"客户端 502 且引擎
+同时没了"，先看 Windows 应用程序日志的 1000 事件（故障模块/偏移）——按上面的
+`-Xlinker "/MAP:..."` 手法能直接定位到源码行。
+
 ## 已完成（2026-10-12）
 - SSD 慢速期归因（10-13 更正为盘固件后台行为，非热）+ PLE 读改回缓冲默认（commit bae0eae，已部署）：见第 4 项。
 - kvsnap 检查点去重（commit 6fea337，已部署）：chat/responses 回合不再写终态 SSD 检查点。
