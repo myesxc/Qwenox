@@ -6284,7 +6284,9 @@ struct GpuModel {
         // now, completions collected in ple_join -- no threads. Same rows, same
         // staging bytes as the threaded pump below. QWENOX_PLE_INLINE=0: off.
         static const bool ple_inline = !env_zero("QWENOX_PLE_INLINE");
-        if (ple_inline && (size_t)P * 16 <= PleWin::DEPTH) {
+        // DEPTH_MAX（=512）对应上游的 PleWin::DEPTH；无缓冲（QWENOX_PLE_DIRECT=1）
+        // 时行为未对齐读，inline 路径不支持，退回线程泵。
+        if (ple_inline && !PLE_PUMP.direct && (size_t)P * 16 <= PleWin::DEPTH_MAX) {
           fl.addrs.resize((size_t)P * 16);
           for (int t = 0; t < P; t++)
             for (int h = 0; h < 16; h++) {
@@ -7098,8 +7100,9 @@ struct GpuModel {
             stg_dev, d_eb, ple_tscale, n16);
       }
       // staging is free once the dequant ran; gates the next gather into buf
-      CK(hipEventRecord(ple_stg_ev[ple_buf], g_str));
-      ple_stg_ev_ok[ple_buf] = true;
+      // （本分支把原有的 ple_stg_ev[2] 并入环形预取的 ple_ring_ev，槽 0/1 即原暂存对）
+      CK(hipEventRecord(ple_ring_ev[ple_buf], g_str));
+      ple_ring_ev_ok[ple_buf] = true;
       ple_par = ple_buf ^ 1;
     }
     if (ple_on) {  // device phase, same shape as enq_ple_device_b over R rows

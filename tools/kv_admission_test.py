@@ -36,6 +36,9 @@ def main():
         (work / "kv_admission_serve.inc").write_text(source[start:end], encoding="utf-8")
         binary = work / ("kv_admission_test.exe" if os.name == "nt" else "kv_admission_test")
         command = [compiler, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+                   # The slice is a partial view of 51_host_cfg.inc: helpers the
+                   # test doesn't drive must not fail the build.
+                   "-Wno-unused-function",
                    "-D_CRT_SECURE_NO_WARNINGS", "-I", str(work),
                    str(root / "tools/kv_admission_test.cpp"), "-o", str(binary)]
         if os.name != "nt":

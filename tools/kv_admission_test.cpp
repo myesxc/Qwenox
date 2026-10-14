@@ -5,6 +5,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <stdexcept>
@@ -25,7 +27,23 @@ struct GpuModel {
     if (mutating.load()) unsafe_reads++;
     return pages[(size_t)slot];
   }
+  static bool env_zero(const char* k) {  // used by the scheduler knobs in the slice
+    const char* v = getenv(k);
+    return v && v[0] == '0' && v[1] == 0;
+  }
 };
+
+// The turnstile calls into the QWENOX_TURN_PROF diagnostics (defined above the
+// slice in 51_host_cfg.inc): stub them off, i.e. exactly what production does
+// with QWENOX_TURN_PROF unset. The admission semantics under test don't change.
+enum TurnTag { TT_WORKER = 0, TT_VR = 1, TT_DR = 2, TT_N = 3 };
+static thread_local int tl_turn_tag = TT_WORKER;
+static const bool g_turn_prof = false;
+struct TurnProf {
+  void on_acquire() {}
+  void on_release(int) {}
+};
+static TurnProf g_turnprof;
 
 #include "kv_admission_serve.inc"
 
