@@ -52,6 +52,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -86,6 +87,12 @@ struct RenderResult {
     std::string text;   // when ok
     std::string error;  // when !ok: the exact raise_exception / jinja2
                         // runtime error message the template would produce
+    // Byte offset in `text` of the <|image_pad|> inside each placeholder span
+    // this render inserted for an image item, in order. This is what tells a
+    // template-placed placeholder apart from the same literal appearing in
+    // message content: vision::encode_prompt expands only these positions and
+    // treats every other pad literal in the text as ordinary text.
+    std::vector<size_t> image_pad_offsets;
 };
 
 // `messages` is nullptr when the request carries no "messages" key at all

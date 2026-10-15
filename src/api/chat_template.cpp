@@ -335,6 +335,18 @@ bool py_in(const char* needle, const json& item) {
 // ---------------------------------------------------------------------------
 // Renderer — mirrors the template top to bottom.
 // ---------------------------------------------------------------------------
+
+// render_content emits this marker for every image item instead of the vision
+// span itself; run() replaces each marker with the real span at the end and
+// records where it landed. The control bytes are not Python whitespace (so
+// py_trim leaves them alone) and not a <|think_*|> control tag, so the marker
+// survives every content transformation between render_content and the final
+// text intact — one final pass then yields the placeholders' true offsets.
+// The contract with vision::encode_prompt is exactly that: a pad literal at a
+// recorded offset is a placeholder; any other pad literal in the text is
+// ordinary text (the model may quote the span, a tool result may contain it).
+constexpr const char* kImageSentinel = "\x01\x02qwenox-image\x02\x01";
+
 class Renderer {
   public:
     explicit Renderer(const Options& opts) : opts_(opts) {
@@ -343,6 +355,10 @@ class Renderer {
 
     // Valid after run(): the thinking state the render settled on.
     bool thinking() const { return thinking_; }
+
+    // Valid after run(): <|image_pad|> offsets of the placeholders this render
+    // inserted, in text order (see RenderResult::image_pad_offsets).
+    const std::vector<size_t>& image_pad_offsets() const { return image_pad_offsets_; }
 
     std::string run(const json* messages) {
         std::string out;
@@ -700,6 +716,21 @@ class Renderer {
                 out += "<think>\n";
             }
         }
+        // --- image placeholders -------------------------------------------
+        // Expand every sentinel into the real vision span, recording where its
+        // <|image_pad|> sits in the final text (see kImageSentinel). A sentinel
+        // cut in half by max_tool_response_chars truncation is not found here:
+        // that image ends up without a placeholder and encode_prompt reports
+        // the count mismatch instead of silently misplacing the pads.
+        static constexpr const char* kSpan = "<|vision_start|><|image_pad|><|vision_end|>";
+        const size_t span_len = std::strlen(kSpan);
+        const size_t sentinel_len = std::strlen(kImageSentinel);
+        const size_t pad_in_span = std::strlen("<|vision_start|>");
+        for (size_t at = out.find(kImageSentinel); at != std::string::npos;
+             at = out.find(kImageSentinel, at + span_len)) {
+            out.replace(at, sentinel_len, kSpan);
+            image_pad_offsets_.push_back(at + pad_in_span);
+        }
         return out;
     }
 
@@ -718,7 +749,7 @@ class Renderer {
                     if (add_vision_id_) {
                         out += "Picture " + std::to_string(image_count_) + ": ";
                     }
-                    out += "<|vision_start|><|image_pad|><|vision_end|>";
+                    out += kImageSentinel;
                 } else if (is_video_item(item)) {
                     if (is_system_content) raise("System message cannot contain videos.");
                     if (do_vision_count) ++video_count_;
@@ -760,6 +791,7 @@ class Renderer {
     std::string effort_ = "medium";
     long image_count_ = 0;
     long video_count_ = 0;
+    std::vector<size_t> image_pad_offsets_;  // filled by the sentinel pass in run()
 };
 
 }  // namespace
@@ -771,6 +803,7 @@ RenderResult render_chat_template(const json* messages, const Options& opts) {
         result.text = renderer.run(messages);
         result.ok = true;
         result.thinking_enabled = renderer.thinking();
+        result.image_pad_offsets = renderer.image_pad_offsets();
     } catch (const TemplateError& e) {
         result.error = e.message;
     } catch (const std::exception& e) {

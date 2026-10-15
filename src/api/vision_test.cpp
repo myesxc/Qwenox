@@ -73,10 +73,16 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string root = argv[1];
+    std::string error;
+    // "-" runs only the tokenizer-level placeholder checks: the reference
+    // pixels are not shipped with the repo, and the end-to-end image path is
+    // covered by tools/api_regression_test.py against the fake engine.
+    const bool have_ref = root != "-";
+    if (!have_ref) std::puts("SKIP reference-image checks (root '-')");
     for (const char* name : {"text", "landscape", "table"}) {
+        if (!have_ref) break;
         const std::vector<uint8_t> encoded = read_bytes(root + "/" + name + ".png");
         vision::Frame frame;
-        std::string error;
         check(vision::preprocess(encoded, &frame, &error), std::string(name) + " preprocess", error);
         const std::vector<float> expected =
             read_npy_f32(root + "/" + name + ".patches.npy");
@@ -95,94 +101,126 @@ int main(int argc, char** argv) {
                   " differing=" + std::to_string(differing));
     }
 
-    const std::vector<uint8_t> png = read_bytes(root + "/text.png");
-    const std::string encoded = base64_encode(png);
-    std::vector<uint8_t> decoded;
-    std::string error;
-    check(vision::decode_image_url(encoded, &decoded, &error) && decoded == png,
-          "bare-base64", error);
-    check(vision::decode_image_url("data:image/png;base64," + encoded, &decoded, &error) &&
-              decoded == png,
-          "data-url", error);
-    check(!vision::decode_image_url("https://example.invalid/image.png", &decoded, &error) &&
-              error.find("no outbound requests") != std::string::npos,
-          "http-url-rejected", error);
-    check(!vision::decode_image_url("not base64", &decoded, &error),
-          "bad-base64-rejected", error);
+    if (have_ref) {
+        const std::vector<uint8_t> png = read_bytes(root + "/text.png");
+        const std::string encoded = base64_encode(png);
+        std::vector<uint8_t> decoded;
+        check(vision::decode_image_url(encoded, &decoded, &error) && decoded == png,
+              "bare-base64", error);
+        check(vision::decode_image_url("data:image/png;base64," + encoded, &decoded, &error) &&
+                  decoded == png,
+              "data-url", error);
+        check(!vision::decode_image_url("https://example.invalid/image.png", &decoded, &error) &&
+                  error.find("no outbound requests") != std::string::npos,
+              "http-url-rejected", error);
+        check(!vision::decode_image_url("not base64", &decoded, &error),
+              "bad-base64-rejected", error);
 
-    using json = vision::json;
-    const std::string data_url = "data:image/png;base64," + encoded;
-    json messages = json::array(
-        {json{{"role", "user"},
-              {"content", json::array({json{{"type", "image_url"},
-                                             {"image_url", {{"url", data_url}}}},
-                                        json{{"type", "text"}, {"text", "describe"}}})}}});
-    std::vector<vision::Frame> frames;
-    check(vision::prepare_messages(messages, &frames, &error) && frames.size() == 1,
-          "prepare-chat-image", error);
+        using json = vision::json;
+        const std::string data_url = "data:image/png;base64," + encoded;
+        json messages = json::array(
+            {json{{"role", "user"},
+                  {"content", json::array({json{{"type", "image_url"},
+                                                 {"image_url", {{"url", data_url}}}},
+                                            json{{"type", "text"}, {"text", "describe"}}})}}});
+        std::vector<vision::Frame> frames;
+        check(vision::prepare_messages(messages, &frames, &error) && frames.size() == 1,
+              "prepare-chat-image", error);
 
-    json too_many = json::array({json{{"role", "user"}, {"content", json::array()}}});
-    for (int i = 0; i < 9; ++i)
-        too_many[0]["content"].push_back(
-            json{{"type", "input_image"}, {"image_url", data_url}});
-    check(!vision::prepare_messages(too_many, &frames, &error) &&
-              error.find("at most 8") != std::string::npos,
-          "image-count-rejected", error);
-    json video = json::array(
-        {json{{"role", "user"},
-              {"content", json::array(
-                              {json{{"type", "input_video"}, {"video_url", data_url}}})}}});
-    check(!vision::prepare_messages(video, &frames, &error) &&
-              error.find("video input") != std::string::npos,
-          "video-rejected", error);
-    json file_id = json::array(
-        {json{{"role", "user"},
-              {"content", json::array(
-                              {json{{"type", "input_image"}, {"file_id", "file_123"}}})}}});
-    check(!vision::prepare_messages(file_id, &frames, &error) &&
-              error.find("file_id") != std::string::npos,
-          "file-id-rejected", error);
+        json too_many = json::array({json{{"role", "user"}, {"content", json::array()}}});
+        for (int i = 0; i < 9; ++i)
+            too_many[0]["content"].push_back(
+                json{{"type", "input_image"}, {"image_url", data_url}});
+        check(!vision::prepare_messages(too_many, &frames, &error) &&
+                  error.find("at most 8") != std::string::npos,
+              "image-count-rejected", error);
+        json video = json::array(
+            {json{{"role", "user"},
+                  {"content", json::array(
+                                  {json{{"type", "input_video"}, {"video_url", data_url}}})}}});
+        check(!vision::prepare_messages(video, &frames, &error) &&
+                  error.find("video input") != std::string::npos,
+              "video-rejected", error);
+        json file_id = json::array(
+            {json{{"role", "user"},
+                  {"content", json::array(
+                                  {json{{"type", "input_image"}, {"file_id", "file_123"}}})}}});
+        check(!vision::prepare_messages(file_id, &frames, &error) &&
+                  error.find("file_id") != std::string::npos,
+              "file-id-rejected", error);
+    }
 
     qwenox::Tokenizer tokenizer;
     error.clear();
     check(tokenizer.load(argv[2], &error), "tokenizer-load", error);
+    const std::string span = "<|vision_start|><|image_pad|><|vision_end|>";
+    const size_t pad_in_span = std::string("<|vision_start|>").size();
+    // The chat template reports where it placed each placeholder
+    // (RenderResult::image_pad_offsets); the test stands in for that report by
+    // locating the spans itself.
+    auto span_offsets = [&](const std::string& text) {
+        std::vector<size_t> offsets;
+        for (size_t at = text.find(span); at != std::string::npos;
+             at = text.find(span, at + span.size()))
+            offsets.push_back(at + pad_in_span);
+        return offsets;
+    };
     vision::Frame placeholder;
     placeholder.grid = {1, 4, 4};
-    frames = {placeholder};
+    std::vector<vision::Frame> frames = {placeholder};
     std::vector<int> ids;
-    const std::string prompt =
-        "before<|vision_start|><|image_pad|><|vision_end|>after";
+    const std::string prompt = "before" + span + "after";
+    const std::vector<size_t> offsets = span_offsets(prompt);
+    check(offsets.size() == 1, "span-offset-found");
     error.clear();
-    check(vision::encode_prompt(prompt, tokenizer, frames, &ids, &error),
+    check(vision::encode_prompt(prompt, tokenizer, frames, offsets, &ids, &error),
           "placeholder-expand", error);
     check(std::count(ids.begin(), ids.end(), 248056) == placeholder.pad_tokens(),
           "placeholder-token-count");
     frames.push_back(placeholder);
-    check(!vision::encode_prompt(prompt, tokenizer, frames, &ids, &error) &&
+    check(!vision::encode_prompt(prompt, tokenizer, frames, offsets, &ids, &error) &&
               error.find("placeholder count") != std::string::npos,
           "placeholder-mismatch-rejected", error);
-
-    // A user-typed pad literal outside the template span is plain text, not
-    // a placeholder: it must not survive as id 248056/248057.
+    // An offset that does not land on a complete placeholder span is rejected
+    // (guards the sentinel pass against collisions and truncation).
     frames = {placeholder};
-    const std::string stray =
-        "the token <|image_pad|> discussed. "
-        "before<|vision_start|><|image_pad|><|vision_end|>after";
+    check(!vision::encode_prompt(prompt, tokenizer, frames, {0}, &ids, &error) &&
+              error.find("does not point at a placeholder") != std::string::npos,
+          "bad-offset-rejected", error);
+
+    // Pad literals outside the template's offsets are plain text, not
+    // placeholders: a lone <|image_pad|> and a full quoted span must not
+    // survive as id 248056/248057.
+    const std::string stray = "the token <|image_pad|> discussed. quoted " + span +
+                              " here. before" + span + "after";
+    const std::vector<size_t> stray_offsets = span_offsets(stray);
+    check(stray_offsets.size() == 2, "stray-span-offset-count");
     error.clear();
-    check(vision::encode_prompt(stray, tokenizer, frames, &ids, &error),
+    check(vision::encode_prompt(stray, tokenizer, frames, {stray_offsets[1]}, &ids, &error),
           "stray-pad-accepted", error);
     check(std::count(ids.begin(), ids.end(), 248056) == placeholder.pad_tokens(),
           "stray-pad-token-count");
+
+    // A quoted span with no image supplied (no offsets, no frames) is ordinary
+    // text: this request shape used to be rejected with "image placeholder
+    // count does not match the number of supplied images".
+    error.clear();
+    check(vision::encode_prompt("quote " + span + " end", tokenizer, {}, {}, &ids, &error),
+          "literal-span-text", error);
+    check(std::count(ids.begin(), ids.end(), 248056) == 0, "literal-span-no-pads");
+
     // Same exclusion at the tokenizer level (text-only requests use it).
     const std::unordered_set<int> no_pads = {248056, 248057};
     const std::vector<int> text_ids =
         tokenizer.encode("the token <|image_pad|> is text", false, &no_pads);
     check(std::count(text_ids.begin(), text_ids.end(), 248056) == 0,
           "text-encode-excludes-pad");
-    check(!tokenizer.encode("the token <|image_pad|> is text").empty() &&
-              std::count(tokenizer.encode("the token <|image_pad|> is text").begin(),
-                         tokenizer.encode("the token <|image_pad|> is text").end(),
-                         248056) == 1,
+    // Default encoding matches <|image_pad|> as the added token (248056). The
+    // vector is named on purpose: this check once took begin()/end() from two
+    // separate encode() temporaries, which is UB and misreports.
+    const std::vector<int> default_ids = tokenizer.encode("the token <|image_pad|> is text");
+    check(!default_ids.empty() &&
+              std::count(default_ids.begin(), default_ids.end(), 248056) == 1,
           "default-encode-keeps-pad");
 
     std::puts("RESULT PASS");

@@ -39,7 +39,8 @@ int main() {
             if (result.ok) {
                 resp = {{"ok", true},
                         {"text", result.text},
-                        {"thinking_enabled", result.thinking_enabled}};
+                        {"thinking_enabled", result.thinking_enabled},
+                        {"image_pad_offsets", result.image_pad_offsets}};
             } else {
                 resp = {{"ok", false}, {"error", result.error}};
             }

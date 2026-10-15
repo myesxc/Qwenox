@@ -564,8 +564,15 @@ void Server::serve_connection(sock_t fd, const std::string& remote) {
             if (res.sse) ok = st.finish();
             else ok = write_response(fd, req, res);
         } catch (const Error& e) {
+            // Errors are answered on the wire and otherwise leave no trace;
+            // log one line so a rejected request is diagnosable from the API
+            // log without the client's response body.
+            std::fprintf(stderr, "qwenox-api: %s %s -> %d %s\n", req.method.c_str(),
+                         req.path.c_str(), e.status, e.message.c_str());
             ok = finish_with_error(e.status, e.message, e.type, e.code);
         } catch (const std::exception& e) {
+            std::fprintf(stderr, "qwenox-api: %s %s -> 500 internal error: %s\n",
+                         req.method.c_str(), req.path.c_str(), e.what());
             ok = finish_with_error(500, std::string("internal error: ") + e.what(),
                                    "server_error", "server_error");
         }

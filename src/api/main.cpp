@@ -594,19 +594,31 @@ std::vector<int> default_ckpt_tokens() {
 // frames == nullptr: raw text (no image expansion, like encode()). starts
 // receives each id's byte offset in `text`.
 bool encode_spliced(const std::string& text, const std::vector<vision::Frame>* frames,
-                    std::vector<int>* ids, std::vector<size_t>* starts, std::string* error) {
+                    const std::vector<size_t>& pad_offsets, std::vector<int>* ids,
+                    std::vector<size_t>* starts, std::string* error) {
     std::vector<int> pad_counts;
     if (frames)
         for (const auto& f : *frames) pad_counts.push_back(f.pad_tokens());
     TokenCache::Hit hit = g_tcache.splice(text, pad_counts);
-    // The reused text must hold exactly the images the reused ids hold.
+    // The reused text must hold exactly the images the reused ids hold. A
+    // placeholder is atomic: the cache only cuts outside one (TokenCache::cut
+    // steps back past <|vision_start|> and pad runs), so it is either fully
+    // inside the reused prefix or fully in the tail — anything else discards
+    // the hit and re-encodes everything.
     if (hit.bytes > 0) {
-        size_t spans = 0;
-        const std::string head = text.substr(0, hit.bytes);
-        for (size_t at = 0; (at = head.find(kVisionPadSpan, at)) != std::string::npos;
-             at += std::strlen(kVisionPadSpan))
-            spans++;
-        if (spans != hit.images || (!frames && hit.images > 0)) hit = TokenCache::Hit{};
+        const size_t pad_in_span = std::strlen("<|vision_start|>");
+        const size_t pad_out_span = std::strlen("<|image_pad|><|vision_end|>");
+        size_t head_images = 0;
+        bool straddles = false;
+        for (size_t offset : pad_offsets) {
+            if (offset + pad_out_span <= hit.bytes) {
+                ++head_images;
+            } else if (offset < pad_in_span || offset - pad_in_span < hit.bytes) {
+                straddles = true;
+            }
+        }
+        if (straddles || head_images != hit.images || (!frames && hit.images > 0))
+            hit = TokenCache::Hit{};
     }
     const std::string tail_text = text.substr(hit.bytes);
     std::vector<int> tail;
@@ -618,7 +630,11 @@ bool encode_spliced(const std::string& text, const std::vector<vision::Frame>* f
             f.grid = (*frames)[i].grid;
             rest.push_back(f);
         }
-        if (!vision::encode_prompt(tail_text, g_tok, rest, &tail, error, &tail_starts))
+        std::vector<size_t> rest_offsets;
+        for (size_t offset : pad_offsets)
+            if (offset >= hit.bytes) rest_offsets.push_back(offset - hit.bytes);
+        if (!vision::encode_prompt(tail_text, g_tok, rest, rest_offsets, &tail, error,
+                                   &tail_starts))
             return false;
     } else {
         // Text-only request: a user-typed <|image_pad|>/<|video_pad|> literal
@@ -2472,7 +2488,7 @@ void handle_completions(const http::Request& q, http::Response* r, http::Stream*
         if (text == nullptr) http::fail(400, kEngineRejected);
         std::vector<size_t> starts;
         std::string err;
-        encode_spliced(text->get_ref<const std::string&>(), nullptr, &spec.ids, &starts, &err);
+        encode_spliced(text->get_ref<const std::string&>(), nullptr, {}, &spec.ids, &starts, &err);
     } else {
         http::fail(400, kEngineRejected);  // an empty prompt is an engine rejection
     }
@@ -3027,7 +3043,7 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
 
     GenSpec spec;
     std::vector<size_t> starts;
-    if (!encode_spliced(rr.text, &frames, &spec.ids, &starts, &normalize_error))
+    if (!encode_spliced(rr.text, &frames, rr.image_pad_offsets, &spec.ids, &starts, &normalize_error))
         http::fail(400, normalize_error);
     for (auto& frame : frames) {
         spec.mrope_grids.push_back(frame.grid);
@@ -3253,7 +3269,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
 
     GenSpec spec;
     std::vector<size_t> starts;
-    if (!encode_spliced(rr.text, &frames, &spec.ids, &starts, &vision_error))
+    if (!encode_spliced(rr.text, &frames, rr.image_pad_offsets, &spec.ids, &starts, &vision_error))
         http::fail(400, vision_error);
     for (auto& frame : frames) {
         spec.mrope_grids.push_back(frame.grid);
@@ -3928,7 +3944,7 @@ void prepare_messages_request(const http::Request& q, http::Response* r, Message
 
     GenSpec& spec = p->spec;
     std::vector<size_t> starts;
-    if (!encode_spliced(rr.text, &frames, &spec.ids, &starts, &error)) http::fail(400, error);
+    if (!encode_spliced(rr.text, &frames, rr.image_pad_offsets, &spec.ids, &starts, &error)) http::fail(400, error);
     if (count_only) return;
     for (auto& frame : frames) {
         spec.mrope_grids.push_back(frame.grid);

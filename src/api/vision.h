@@ -35,12 +35,18 @@ bool preprocess(const std::vector<uint8_t>& bytes, Frame* frame, std::string* er
 bool prepare_messages(const json& messages, std::vector<Frame>* frames,
                       std::string* error);
 
-// Expand only image-pad tokens inside complete vision placeholder spans.
-// `starts` (optional) receives each id's byte offset in `prompt` (the copies
-// of an expanded pad share the pad's offset). Only frames[i].pad_tokens() is
-// read, so the frames may carry grids without patches.
+// Expand only the image-pad tokens the chat template placed. `pad_offsets`
+// (ascending) lists the byte offset of <|image_pad|> inside every placeholder
+// span the render inserted (RenderResult::image_pad_offsets); only those
+// positions are placeholders. Any other <|image_pad|>/<|video_pad|> token in
+// the text — a user-quoted span, a tool result carrying the literal — is
+// re-encoded as ordinary text, never as vision. `starts` (optional) receives
+// each id's byte offset in `prompt` (the copies of an expanded pad share the
+// pad's offset). Only frames[i].pad_tokens() is read, so the frames may carry
+// grids without patches.
 bool encode_prompt(const std::string& prompt, const qwenox::Tokenizer& tokenizer,
-                   const std::vector<Frame>& frames, std::vector<int>* ids,
-                   std::string* error, std::vector<size_t>* starts = nullptr);
+                   const std::vector<Frame>& frames, const std::vector<size_t>& pad_offsets,
+                   std::vector<int>* ids, std::string* error,
+                   std::vector<size_t>* starts = nullptr);
 
 }  // namespace vision
