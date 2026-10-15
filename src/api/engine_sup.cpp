@@ -280,6 +280,15 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
         *err = "engine already running";
         return false;
     }
+    // 与 /admin/engine/start、设置面板同一套校验（有效 KV 池 512K 上限、YaRN
+    // 上限、端口互异等）。托盘菜单直接调到这里，不能假设调用方查过：少了这道
+    // 闸，超池配置（如 MAX_CONTEXT=1M）会越过 95 GiB arena 回退 hipMalloc 到
+    // 共享内存。
+    std::string verr;
+    if (!svcconf::validate_conf(conf, &verr)) {
+        *err = verr;
+        return false;
+    }
     // 与 launch_win.cpp 相同的取值与默认（env > conf > 内置）
     const std::string model_dir = svcconf::cfg(conf, "MODEL_DIR", "models");
     // weights=gguf（设置页/网页选 GGUF）：引擎直接吃 GGUF 首分片（纯 GGUF 启动，

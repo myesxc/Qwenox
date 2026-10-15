@@ -96,6 +96,7 @@ if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; 
 [[ "$KV_POOL_TOKENS" =~ ^(0|[1-9][0-9]*)$ && ${#KV_POOL_TOKENS} -le 8 ]] || fail 'KV_POOL_TOKENS 必须为非负整数'
 [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
 [[ "$MAX_IMAGES" =~ ^[1-9][0-9]*$ && "$MAX_IMAGES" -le 256 ]] || fail 'MAX_IMAGES 范围为 1–256'
+[[ "$MAX_CONTEXT" =~ ^[1-9][0-9]*$ ]] || fail 'MAX_CONTEXT 必须为正整数'
 [[ "$ROPE_ORIGINAL_CTX" =~ ^[1-9][0-9]*$ ]] || fail 'ROPE_ORIGINAL_CTX 必须为正整数'
 [[ "$ROPE_FACTOR" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_FACTOR 必须为非负小数'
 [[ "$ROPE_BETA_FAST" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'ROPE_BETA_FAST 必须为非负小数'
@@ -109,6 +110,12 @@ awk "BEGIN { exit !($ROPE_FACTOR <= 1 || $MAX_CONTEXT <= $ROPE_FACTOR * $ROPE_OR
   fail "MAX_CONTEXT=$MAX_CONTEXT 超出 YaRN 上限 ROPE_FACTOR×ROPE_ORIGINAL_CTX；调小 MAX_CONTEXT 或调大 ROPE_FACTOR（并发容量用 KV_POOL_TOKENS 扩）"
 awk "BEGIN { exit !($ROPE_FACTOR > 1 || $MAX_CONTEXT <= $ROPE_ORIGINAL_CTX) }" || \
   echo "警告：ROPE_FACTOR=1 且 MAX_CONTEXT=$MAX_CONTEXT 超过原生 $ROPE_ORIGINAL_CTX，超出部分的位置编码未验证（需要时请设 ROPE_FACTOR）" >&2
+# 与托盘/网页同一硬闸（service_conf.h validate_conf）：Windows 设备内存是上限
+# 95 GiB 的 arena，有效池 = max(KV_POOL_TOKENS, MAX_CONTEXT)，512K（524288）
+# 以上任何配置都放不下；超出部分会回退 hipMalloc 到共享内存（拖垮整机风险）。
+# 并发容量用 KV_POOL_TOKENS 扩，不要拉伸 MAX_CONTEXT。
+_kv_pool_eff=$(( KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT ))
+(( _kv_pool_eff <= 524288 )) || fail "有效 KV 池 ${_kv_pool_eff} token 超过 512K（524288）上限：Windows 95 GiB 显存 arena 放不下，超出部分会回退到共享内存。请调小 MAX_CONTEXT 或 KV_POOL_TOKENS。"
 (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
 [[ -f build/qwenox-engine-win.exe ]] || fail '缺少 build/qwenox-engine-win.exe，请先运行 bash build_win.sh'
 [[ -f build/qwenox-win.exe ]] || fail '缺少 build/qwenox-win.exe，请先运行 bash build_win.sh api'
