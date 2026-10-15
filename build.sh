@@ -289,15 +289,18 @@ case "$TARGET" in
     ;;
   test)
     build_test
+    # ktest ri_ 组锁 PMAX=48；裸进程无会合时 gemvmr_maxp() 是单序列最优 24，
+    # P>24 会被 dispatch 拒绝、比对读到旧 dy（假失败）。锁 48 与 harness 一致。
     if (( BUNDLE_RUNTIME )); then
       bundle_gpu_runtime build/ktest
       run 8 600 env \
+        "QWENOX_GEMVMR_MAXP=48" \
         "LD_LIBRARY_PATH=$ROOT/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         "ROCBLAS_TENSILE_LIBPATH=$ROOT/build/lib/rocblas/library" \
         "HIPBLASLT_TENSILE_LIBPATH=$ROOT/build/lib/hipblaslt/library" \
         build/ktest
     else
-      run 8 600 build/ktest
+      run 8 600 env "QWENOX_GEMVMR_MAXP=48" build/ktest
     fi
     ;;
   all)
