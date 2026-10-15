@@ -336,6 +336,46 @@ API 日志只剩 `engine connect failed` 与两行 `tcache: reused ...`，没有
 同时没了"，先看 Windows 应用程序日志的 1000 事件（故障模块/偏移）——按上面的
 `-Xlinker "/MAP:..."` 手法能直接定位到源码行。
 
+## 12. 上下文扩容：YaRN 512K Windows 实测通过；1M 不可行（2026-10-15）
+
+**支持情况**：引擎侧 YaRN 完整实现（`src/rope.h`，`QWENOX_ROPE_*` / `--rope-*`，KV 快照
+指纹含全部 rope 参数；`QWENOX_QSA_UNION` 超 256K 自动禁用）；Linux 实机 512K factor 2 已于
+2026-09-30 验证（YARN-512K-RESULTS.md，500K 检索 3/3、352K 尾部 PPL +0.4%）。
+
+**1M 不可行**，三层各自独立成立：
+1. 有效池硬闸：有效池 = max(KV_POOL_TOKENS, MAX_CONTEXT)，> 524288 直接拒
+   （`service_conf.h validate_conf`，注释即"512K 以上任何配置都放不下"）。
+2. arena 预算：Windows 一次性 hipMalloc 上限 95 GiB（96 GiB 实测失败）；实测 512K 配置
+   estimate 91.69 + 4 slack = 95.69 → clamp 到 95.00；1M 估算 ≈ 111 GiB，超出 ~16 GiB。
+3. 放不下的部分回退 hipMalloc → 共享内存——正是用户红线（占满共享显存触发死机）。
+   引擎的 clamp 只打印一行警告，不会拒绝启动。
+
+**512K Windows 实测（2026-10-15，当前二进制，含 cb738a7/1099cdb/4b98028）**：
+- 启动（`MAX_CONTEXT=524288 ROPE_FACTOR=2`，生产其余参数不动）：`RoPE: YaRN factor=2
+  original_ctx=262144 beta_fast=32 beta_slow=1 attention_scale=1.06931`；devarena clamp
+  到 95.00 GiB（设计内行为，非错误）；**无任何 hipMalloc 回退**；arena-debug 实际峰值
+  ~90.9 GiB；`HIP free 11.49/107.92 GiB`。基线对照：256K 生产 estimate 80.54 / request
+  84.54，+256K 池约 +9.6 GiB，与 PORTING-WINDOWS.md 表格一致。
+- `/health`：`context 524288`、`rope_scaling {type: yarn, factor: 2.0, attention_scale
+  1.0693147180559945}`。
+- 300K 针测试（`tools/yarn_ladder.py --only 300k`）：prompt 300149 token、**3/3 命中**、
+  prefill 1200 tok/s、decode 44.4 tok/s（MTP acc 0.861）、255 s。短请求（yarn_short_probe.py）
+  正常。测试实例设 `KVSNAP_MAX_GB=0` 保护生产 SSD 快照缓存。
+
+**闸门修复（19d4ab5）**：此前只有 /admin/engine/start 与设置面板校验池上限，`start_win.sh`
+与托盘菜单直调的 `enginesup::start` 都漏检——`MAX_CONTEXT=1048576 ROPE_FACTOR=4` 能从这两
+条路静默启动并触发回退。已补：enginesup::start 开头 validate_conf；start_win.sh 补
+MAX_CONTEXT 正整数检查 + 有效池 ≤ 524288 硬闸。验证：1M 两处均拒绝，512K/256K 通过，
+`api_regression_test.py` + `api_marker_verify.py` 在新二进制上 RESULT PASS。
+
+**切换配方**（要上 512K 时）：service.conf 改 `MAX_CONTEXT=524288`、`ROPE_FACTOR=2`，
+其余不动，重启服务；客户端 contextWindow 同步调大。注意：YaRN factor 2 会改变短上下文
+分布（短文本 mean KLD 0.0234 / same-top 93.5%，YARN-512K.md 建议不要给短流量常开）；
+切换后 KV 快照指纹变化，旧 SSD 快照不复用（首次请求全量 prefill）。
+
+**测试污染说明**：假引擎 rig 一次误从仓库根启动（cwd=repo），把 5 条测试条目写进了生产
+`data/tcache.bin`（LRU 逐出 5 条旧条目；文件按 GDTC1 头逐条解析验证完好，无正确性影响）。
+
 ## 已完成（2026-10-12）
 - SSD 慢速期归因（10-13 更正为盘固件后台行为，非热）+ PLE 读改回缓冲默认（commit bae0eae，已部署）：见第 4 项。
 - kvsnap 检查点去重（commit 6fea337，已部署）：chat/responses 回合不再写终态 SSD 检查点。
