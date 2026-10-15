@@ -4,6 +4,7 @@
 // Linux 不提供启停（start/stop 返回不支持），status 仍可探测外部引擎。
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "../service_conf.h"
@@ -21,6 +22,12 @@ struct Status {
 };
 
 bool supported();  // 仅 Windows 为 true
+
+// 引擎进程生命周期变化的通知：新引擎开始监听（starting→running）、引擎进程
+// 结束（stop 生效 / 超时杀掉 / 意外退出）。在监管线程上同步调用，只应做
+// 轻量且不阻塞的事；main.cpp 用它把连接池里指向旧进程的 socket 标为过期
+// （旧进程关掉的 TCP 连接在下一次写之前看不出来）。重复注册后者覆盖前者。
+void set_lifecycle_listener(std::function<void()> fn);
 
 // 引擎存活探测（心跳）：connect（500ms 上限）→ 发 "SNAP\n" → 500ms 内读回一行。
 //   alive   回的是 "P ..."：对端确实是 Qwenox 引擎

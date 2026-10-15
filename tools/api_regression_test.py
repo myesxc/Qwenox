@@ -11,6 +11,11 @@ import urllib.request
 
 def engine_verb(addr, verb):
     """One line to the fake engine itself (its test hooks), reply line back."""
+    return json.loads(engine_command(addr, verb))
+
+
+def engine_command(addr, verb):
+    """Same, for hooks whose reply is plain text (`RESTART` -> "OK <n>")."""
     host, port = addr.rsplit(":", 1)
     with socket.create_connection((host, int(port)), timeout=5) as conn:
         conn.sendall((verb + "\n").encode("ascii"))
@@ -20,7 +25,7 @@ def engine_verb(addr, verb):
             if not chunk:
                 break
             reply += chunk
-    return json.loads(reply.decode("utf-8"))
+    return reply.decode("utf-8").strip()
 
 
 def request(base, path, body):
@@ -69,7 +74,7 @@ def main():
     parser.add_argument("--slots", type=int, default=1,
                         help="the fake engine's --slots (concurrent generations)")
     parser.add_argument("--engine", default="127.0.0.1:18730",
-                        help="the fake engine's own port (GENLOG hook)")
+                        help="the fake engine's own host:port (for its GENLOG/RESTART hooks)")
     args = parser.parse_args()
 
     tiny_png = (
@@ -334,6 +339,45 @@ def main():
         "prompt": "x", "temperature": 0, "max_tokens": 2,
     })
     check(status == 200, "engine-auto-reconnect-next-request", raw[:300])
+
+    # An engine restart leaves the API's pool (and its control connection)
+    # holding sockets to the process that went away. Nothing is written to
+    # them until the next request, so the first request after the restart
+    # used to be the one that found out, as a 502 "engine connection lost".
+    # The fake engine's RESTART hook shuts every other connection down the
+    # way a dead process would; the very next request must still succeed.
+    hello = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "enable_thinking": False, "temperature": 0, "max_tokens": 4,
+    }
+
+    def restart_engine(name):
+        reply = engine_command(args.engine, "RESTART")
+        # at least the warmed pool socket and the control socket
+        check(reply.startswith("OK ") and int(reply.split()[1]) >= 2, name, reply)
+
+    status, _, raw = request(args.base, "/v1/chat/completions", hello)
+    check(status == 200, "engine-restart-warm-pool", raw[:300])
+    status, _, raw = get(args.base, "/memory")
+    check(status == 200, "engine-restart-warm-control", raw[:300])
+    restart_engine("engine-restart-dropped-sockets")
+    # pool socket found dead at the pre-GEN handshake -> reconnect, no 502
+    status, _, raw = request(args.base, "/v1/chat/completions", hello)
+    check(status == 200 and json.loads(raw)["choices"][0]["message"]["content"] == "Hi",
+          "engine-restart-first-request-ok", raw[:300])
+    # control socket marked stale by that -> reopened before MEM goes out
+    status, _, raw = get(args.base, "/memory")
+    check(status == 200 and json.loads(raw)["device_current_bytes"] == 100,
+          "engine-restart-control-reopened", raw[:300])
+    restart_engine("engine-restart-dropped-sockets-again")
+    # control socket dead and not yet known stale -> MEM retried on a fresh one
+    status, _, raw = get(args.base, "/memory")
+    check(status == 200 and json.loads(raw)["device_current_bytes"] == 100,
+          "engine-restart-first-control-query-ok", raw[:300])
+    # ...which marked the pool stale -> reopened before the GEN goes out
+    status, _, raw = request(args.base, "/v1/chat/completions", hello)
+    check(status == 200 and json.loads(raw)["choices"][0]["message"]["content"] == "Hi",
+          "engine-restart-pool-reopened", raw[:300])
 
     status, _, raw = get(args.base, "/health")
     check(status == 200 and json.loads(raw).get("slots") == args.slots,

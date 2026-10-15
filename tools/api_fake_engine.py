@@ -21,6 +21,28 @@ SLOTS = 1
 POOL = 0
 TRACE = []
 TRACE_LOCK = threading.Lock()
+CONNS = set()  # every live client connection, for RESTART
+CONNS_LOCK = threading.Lock()
+
+
+def drop_other_connections(keep):
+    """Stand in for the engine process going away under the front-end.
+
+    Every connection but `keep` is shut down while it sits idle, which is what
+    a restart leaves behind: the front-end's pooled sockets still look
+    connected to it until it writes. Only shutdown here -- the owning handler
+    thread wakes from recv and closes its own socket, so a fd is never freed
+    from under a thread still using it.
+    """
+    with CONNS_LOCK:
+        others = [conn for conn in CONNS if conn is not keep]
+    for conn in others:
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    return len(others)
+
 
 # Think-guard scenarios (api_think_guard_test.py), keyed by max_tokens rounded
 # up to a multiple of 100 so a resume (max_tokens minus what the first run
@@ -72,6 +94,18 @@ def guard_scenario(key, resumed, max_tokens):
 
 
 def handle(conn):
+    with CONNS_LOCK:
+        CONNS.add(conn)
+    try:
+        serve_connection(conn)
+    except OSError:
+        pass  # peer reset, or RESTART shut this socket down under us
+    finally:
+        with CONNS_LOCK:
+            CONNS.discard(conn)
+
+
+def serve_connection(conn):
     pending = b""
 
     def record_cancel(req):
@@ -152,6 +186,10 @@ def handle(conn):
                 with TRACE_LOCK:
                     send_line(conn, json.dumps(GEN_LOG))
                     GEN_LOG.clear()
+                continue
+            if line == "RESTART":
+                # Test hook, not an engine verb: see drop_other_connections.
+                send_line(conn, f"OK {drop_other_connections(conn)}")
                 continue
             if line.startswith("X "):
                 record_cancel(int(line.split()[1]))

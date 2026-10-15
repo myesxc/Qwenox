@@ -92,8 +92,21 @@ class EngineClient {
     void close();
     bool connected() const { return fd_.load(std::memory_order_acquire) >= 0; }
 
+    // Which engine process this socket was opened to, as counted by the
+    // owner (the front-end bumps its counter whenever the engine is started
+    // or stopped). A pooled socket from an older process is still `connected`
+    // -- the peer's close is invisible until the next write -- so the owner
+    // compares this before reusing it.
+    unsigned long long epoch() const { return epoch_.load(std::memory_order_acquire); }
+    void set_epoch(unsigned long long e) { epoch_.store(e, std::memory_order_release); }
+
     // Send PING and wait for PONG.
     bool ping(std::string* err);
+    // PING/PONG bounded by timeout_s, as a liveness check before the first
+    // byte of a request goes out on a pooled socket. False means the socket
+    // is dead (it is closed, so the owner can reconnect); nothing of the
+    // request has been sent at that point, so retrying is always safe.
+    bool probe_alive(double timeout_s);
     // Send INFO and return the raw `I ...` line (for context/drafter probing).
     bool info(std::string* line, std::string* err);
     // Send MEM and return the raw `M ...` engine-memory line.
@@ -123,10 +136,12 @@ class EngineClient {
   private:
     bool write_all(const void* data, size_t n);
     bool read_line(std::string* line, double timeout_s);
-    bool send_ping_pong_c(const char* verb, std::string* line, std::string* err);
+    bool send_ping_pong_c(const char* verb, std::string* line, std::string* err,
+                          double timeout_s);
     void invalidate(sock_t bad_fd);
 
     std::atomic<sock_t> fd_{-1};
+    std::atomic<unsigned long long> epoch_{0};
     mutable std::mutex write_mtx_;   // guards fd_ writes only
     std::mutex gen_mtx_;             // one generation at a time
     std::string buf_;                // read buffer

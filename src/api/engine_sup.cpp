@@ -29,6 +29,18 @@ std::mutex g_mtx;
 Status g_st;
 #ifdef _WIN32  // 仅 Windows 监管线程/stop() 使用；Linux 下未用会触发 -Werror=unused-variable
 bool g_stopping = false;  // stop() 主动停止：监管线程把退出记为 stopped 而非 exited
+std::function<void()> g_lifecycle;  // set_lifecycle_listener()，g_mtx 保护
+
+// 锁外调用监听者：回调会去拿 API 自己的锁，持着 g_mtx 调会埋下反向锁序。
+// 只有 Windows 的监管线程会调（Linux 不启停引擎）。
+[[maybe_unused]] void notify_lifecycle() {
+    std::function<void()> fn;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        fn = g_lifecycle;
+    }
+    if (fn) fn();
+}
 #endif
 
 // 探测的两段超时（connect、读回复）各 500ms：阻塞 connect 对黑洞地址（防火墙
@@ -156,8 +168,11 @@ DWORD WINAPI monitor_thread(LPVOID) {
     for (;;) {
         if (WaitForSingleObject(g_proc, 0) == WAIT_OBJECT_0) break;  // 提前退出
         if (probe(g_host, g_port) == Probe::alive) {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            if (g_st.state == "starting") g_st.state = "running";
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                if (g_st.state == "starting") g_st.state = "running";
+            }
+            notify_lifecycle();
             break;
         }
         if (GetTickCount64() > deadline) {
@@ -181,6 +196,7 @@ DWORD WINAPI monitor_thread(LPVOID) {
         CloseHandle(g_proc);
         g_proc = nullptr;
     }
+    notify_lifecycle();
     return 0;
 }
 
@@ -194,6 +210,11 @@ bool supported() {
 #else
     return false;
 #endif
+}
+
+void set_lifecycle_listener(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_lifecycle = std::move(fn);
 }
 
 Probe probe(const std::string& host, int port, std::string* snap) {
