@@ -461,6 +461,17 @@ class TokenCache {
         // The whole transcript matched: the engine's `cont` resumes right at its
         // end, so cut there (unless the text continues inside a UTF-8 char).
         bool whole = k == n && !(same < text.size() && (uint8_t(text[same]) & 0xC0) == 0x80);
+        // A media marker this request would encode as ordinary text must not be
+        // reused as the added token it was recorded as (see
+        // vision::placeholder_marker_ids): step back to before the first one.
+        // Markers written as plain text are ordinary ids and give no hit here.
+        const std::unordered_set<int>& markers = vision::placeholder_marker_ids();
+        for (size_t i = 0; i < k; ++i) {
+            if (!markers.count(t.ids[i])) continue;
+            k = i;
+            whole = false;
+            break;
+        }
         for (;;) {
             // Otherwise the engine can only resume from a checkpoint below k
             // anyway, so cut right after an added token: the rest of the text
@@ -641,9 +652,13 @@ bool encode_spliced(const std::string& text, const std::vector<vision::Frame>* f
         // must tokenize as ordinary text. As the added-token ids it would
         // make the engine read this as a vision request without images and
         // reject it ("image placeholder ... without MROPE/VIMG"); only the
-        // vision path (encode_prompt) may produce those ids.
-        static const std::unordered_set<int> kTextNoPads = {kImagePadId, kVideoPadId};
-        for (const auto& s : g_tok.encode_with_offsets(tail_text, false, &kTextNoPads)) {
+        // vision path (encode_prompt) may produce those ids. The same holds
+        // for the other media markers (vision_start/end, audio_*): as added
+        // tokens in a message they put the model back in a template region it
+        // never saw outside a placed placeholder span and it closes the turn
+        // right after writing one.
+        const std::unordered_set<int>& no_markers = vision::placeholder_marker_ids();
+        for (const auto& s : g_tok.encode_with_offsets(tail_text, false, &no_markers)) {
             tail.push_back(s.id);
             tail_starts.push_back(s.start);
         }
@@ -767,6 +782,28 @@ GenOutcome run_generation(GenSpec& spec,
     p.presence = spec.presence;
     p.frequency = spec.frequency;
     p.bias = spec.bias;
+    // Never let the model write a media marker as an added token: the sequence
+    // only exists inside a placeholder span the template placed, and a turn
+    // that ends right after the model emits one is what the client sees as
+    // "the answer stops at <|image_pad|>". Discouraged with a large negative
+    // bias, so the model writes the literal as ordinary text (which is also
+    // what this request's own prompt encoding does with it). Sampled requests
+    // only: the engine rejects BIAS on a greedy GEN line rather than ignoring
+    // it. QWENOX_API_MARKER_BIAS=<value> overrides, 0 disables.
+    if (spec.sample) {
+        static const float marker_bias = [] {
+            const char* e = getenv("QWENOX_API_MARKER_BIAS");
+            return e != nullptr ? (float)atof(e) : -1e4f;
+        }();
+        if (marker_bias != 0.0f) {
+            for (int marker_id : vision::placeholder_marker_ids()) {
+                bool asked = false;
+                for (const auto& b : p.bias)
+                    if (b.first == marker_id) asked = true;
+                if (!asked) p.bias.emplace_back(marker_id, marker_bias);
+            }
+        }
+    }
     p.logprobs = spec.logprobs;
     p.mrope_grids = spec.mrope_grids;
     p.patches = std::move(spec.patches);

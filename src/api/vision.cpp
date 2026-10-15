@@ -29,6 +29,17 @@
 #endif
 
 namespace vision {
+
+// The media markers of this tokenizer: vision_start/end, vision_pad,
+// image/video_pad, audio_start/end, audio_pad. Everything else the model may
+// legitimately print (im_start/im_end, tool_call/tool_response, the think pair,
+// grounding boxes) stays an added token.
+const std::unordered_set<int>& placeholder_marker_ids() {
+    static const std::unordered_set<int> ids = {248053, 248054, 248055, 248056,
+                                                248057, 248070, 248071, 248076};
+    return ids;
+}
+
 namespace {
 
 constexpr size_t kMaxEncodedBytes = 64u << 20;
@@ -47,7 +58,6 @@ constexpr int kMinPixels = 256 * 256;
 constexpr int kMaxPixels = 2560 * 1440;
 constexpr double kMaxAspect = 200.0;
 constexpr int kImageToken = 248056;
-constexpr int kVideoToken = 248057;
 constexpr const char* kPadSpan =
     "<|vision_start|><|image_pad|><|vision_end|>";
 
@@ -601,6 +611,24 @@ bool encode_prompt(const std::string& prompt, const qwenox::Tokenizer& tokenizer
     const std::vector<qwenox::TokenSpan> spans = tokenizer.encode_with_offsets(prompt);
     ids->clear();
     if (starts) starts->clear();
+    // The spans the template placed, as byte ranges: the media markers inside
+    // one keep their added-token form (that is the sequence the model was
+    // trained on), a marker anywhere else is a literal mention and encodes as
+    // ordinary text. Token spans arrive in ascending text order.
+    std::vector<std::pair<size_t, size_t>> template_spans;
+    template_spans.reserve(pad_offsets.size());
+    for (size_t offset : pad_offsets) {
+        const size_t at = offset - pad_in_span;
+        template_spans.emplace_back(at, at + span_len);
+    }
+    const std::unordered_set<int>& markers = placeholder_marker_ids();
+    size_t span_i = 0;
+    auto in_template_span = [&](size_t start) {
+        while (span_i < template_spans.size() && template_spans[span_i].second <= start)
+            ++span_i;
+        return span_i < template_spans.size() && start >= template_spans[span_i].first &&
+               start < template_spans[span_i].second;
+    };
     size_t image_index = 0;
     for (const auto& token : spans) {
         if (image_index < pad_offsets.size() && token.id == kImageToken &&
@@ -609,16 +637,16 @@ bool encode_prompt(const std::string& prompt, const qwenox::Tokenizer& tokenizer
             ids->insert(ids->end(), static_cast<size_t>(count), kImageToken);
             if (starts) starts->insert(starts->end(), static_cast<size_t>(count), token.start);
             ++image_index;
-        } else if (token.id == kImageToken || token.id == kVideoToken) {
-            // A pad token the chat template did not place: the user typed the
-            // literal string. Re-encode it as ordinary text — the engine
-            // walks image-token runs against this request's grids (set_mrope)
-            // and would reject (or misplace) a placeholder it has no image
-            // for.
-            static const std::unordered_set<int> kNoPads = {kImageToken, kVideoToken};
+        } else if (markers.count(token.id) != 0 && !in_template_span(token.start)) {
+            // A marker the chat template did not place: the user quoted the
+            // literal (or the model wrote it last turn). Re-encode it as
+            // ordinary text — the engine walks image-token runs against this
+            // request's grids (set_mrope) and would reject (or misplace) a
+            // placeholder it has no image for, and the model closes its turn
+            // after writing a marker the template never put in a message.
             const std::string piece =
                 prompt.substr(token.start, token.end - token.start);
-            for (const auto& t : tokenizer.encode_with_offsets(piece, false, &kNoPads)) {
+            for (const auto& t : tokenizer.encode_with_offsets(piece, false, &markers)) {
                 ids->push_back(t.id);
                 if (starts) starts->push_back(token.start + t.start);
             }

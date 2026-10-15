@@ -34,6 +34,10 @@ GUARD_CALL = [248058, 198, 27, 1628, 27362, 67017, 29, 198, 27, 15704, 28, 8656,
 GUARD_HI = [12675]
 GUARD_LOG = []
 GUARD_RESUMES = {}
+# Every GEN the engine saw, as {"req", "sample", "bias"} (bias = [[id, value]]).
+# GENLOG returns and clears it — used to check the API's default media-marker
+# bias without a real engine.
+GEN_LOG = []
 
 
 def guard_scenario(key, resumed, max_tokens):
@@ -144,6 +148,11 @@ def handle(conn):
                     send_line(conn, json.dumps(GUARD_LOG))
                     GUARD_LOG.clear()
                 continue
+            if line == "GENLOG":
+                with TRACE_LOCK:
+                    send_line(conn, json.dumps(GEN_LOG))
+                    GEN_LOG.clear()
+                continue
             if line.startswith("X "):
                 record_cancel(int(line.split()[1]))
                 continue
@@ -156,6 +165,16 @@ def handle(conn):
             n_ids_at = 4 + n_eos
             n_ids = int(fields[n_ids_at])
             ids = [int(v) for v in fields[n_ids_at + 1:n_ids_at + 1 + n_ids]]
+
+            bias = []
+            if "BIAS" in fields:
+                at = fields.index("BIAS")
+                count = int(fields[at + 1])
+                values = fields[at + 2:at + 2 + count * 2]
+                bias = [[int(values[i]), float(values[i + 1])]
+                        for i in range(0, len(values), 2)]
+            with TRACE_LOCK:
+                GEN_LOG.append({"req": req, "sample": "SAMPLE" in fields, "bias": bias})
 
             grids = []
             if "MROPE" in fields:

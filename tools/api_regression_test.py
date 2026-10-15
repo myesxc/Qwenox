@@ -2,10 +2,25 @@
 """Front-end regression checks against the deterministic api_fake_engine.py."""
 import argparse
 import json
+import socket
 import threading
 import time
 import urllib.error
 import urllib.request
+
+
+def engine_verb(addr, verb):
+    """One line to the fake engine itself (its test hooks), reply line back."""
+    host, port = addr.rsplit(":", 1)
+    with socket.create_connection((host, int(port)), timeout=5) as conn:
+        conn.sendall((verb + "\n").encode("ascii"))
+        reply = b""
+        while not reply.endswith(b"\n"):
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            reply += chunk
+    return json.loads(reply.decode("utf-8"))
 
 
 def request(base, path, body):
@@ -53,6 +68,8 @@ def main():
     parser.add_argument("--base", default="http://127.0.0.1:18731")
     parser.add_argument("--slots", type=int, default=1,
                         help="the fake engine's --slots (concurrent generations)")
+    parser.add_argument("--engine", default="127.0.0.1:18730",
+                        help="the fake engine's own port (GENLOG hook)")
     args = parser.parse_args()
 
     tiny_png = (
@@ -367,6 +384,33 @@ def main():
     check(len(slow_result) == args.slots and all(r[0] == 200 for r in slow_result),
           "engine-queued-owner-completes")
     check(slow_wall < 3.5, "engine-slots-run-concurrently", f"{slow_wall:.1f}s")
+
+    # Media markers: the model must never write one as an added token (the
+    # sequence only exists inside a template-placed span; a turn that ends
+    # right after one is what clients see as "the answer stops at
+    # <|image_pad|>"). Sampled requests therefore carry a default negative bias
+    # on the marker ids; greedy requests carry none (the engine rejects BIAS on
+    # a greedy GEN line).
+    markers = [248053, 248054, 248055, 248056, 248057, 248070, 248071, 248076]
+    engine_verb(args.engine, "GENLOG")  # clear
+    status, _, raw = request(args.base, "/v1/chat/completions", {
+        "model": "qwenox",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 8, "temperature": 0.7, "top_p": 0.9, "seed": 4242,
+    })
+    gen = engine_verb(args.engine, "GENLOG")[-1]
+    biased = {int(pair[0]): float(pair[1]) for pair in gen["bias"]}
+    check(status == 200 and gen["sample"], "marker-bias-sampled-request", raw[:200])
+    check(all(m in biased and biased[m] < -1000.0 for m in markers),
+          "marker-bias-present", sorted(biased)[:12])
+    status, _, raw = request(args.base, "/v1/chat/completions", {
+        "model": "qwenox",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 8, "temperature": 0,
+    })
+    gen = engine_verb(args.engine, "GENLOG")[-1]
+    check(status == 200 and not gen["sample"] and gen["bias"] == [],
+          "marker-bias-greedy-none", gen["bias"][:4])
 
     print("RESULT PASS")
 
