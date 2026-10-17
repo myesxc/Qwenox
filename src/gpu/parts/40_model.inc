@@ -6490,6 +6490,20 @@ struct GpuModel {
       ple_gather_run(fl);
       for (auto& th : fl.pool) th.join();
       fl.pool.clear();
+#ifdef _WIN32
+      // The chain's flights are local: nothing will ever ple_join() them. The
+      // inline path posts its reads on g_ple_win and relies on a later
+      // wait_all() to reap them, so reap them here -- otherwise 16*P
+      // completions stay in g_ple_win's IOCP forever and the next per-token
+      // run() dequeues one as a foreign OVERLAPPED and aborts (the
+      // "ple_win: read completion failed (row=...)" engine death). Waiting
+      // also gives the inline path the threaded pumps' guarantee: the staging
+      // bytes are filled before pa.ready lets the consumer dequant them.
+      if (fl.inline_io) {
+        PLE_PUMP.wait_all();
+        fl.inline_io = false;
+      }
+#endif
       pa.g_ms[i] = std::chrono::duration<double, std::milli>(
                        std::chrono::steady_clock::now() - fl.start)
                        .count();

@@ -9,6 +9,14 @@ place with the same ids, the encoding/template layer is not the cause.
 
     python -I engine_replay_ids.py --list
     python -I engine_replay_ids.py --entry-len 41753 --cut-generated 436
+    python -I engine_replay_ids.py --entry-len 6538 --cut-generated 366 \
+        --ckpt 248058,248069
+
+The API's GEN line carries CKPT hints (the ids it checkpoints RAM state at
+mid-generation); --ckpt replays with the same hints, which is what makes the
+engine pause at </tool_call>/</think> like a real request.  --tail keeps only
+the last N ids (after --cut-generated), for replaying the tail of a long entry
+as a standalone prompt.
 
 The tool speaks the engine's line protocol directly:
 
@@ -93,7 +101,7 @@ def describe(ids, special, inv, c2b):
 
 
 # -------------------------------------------------------------------- engine --
-def generate(host, port, ids, max_tokens, drafter, timeout):
+def generate(host, port, ids, max_tokens, drafter, timeout, ckpt=()):
     req = 1
     line = "GEN %d %d %d" % (req, max_tokens, len(EOS))
     for e in EOS:
@@ -101,6 +109,10 @@ def generate(host, port, ids, max_tokens, drafter, timeout):
     line += " %d" % len(ids)
     for i in ids:
         line += " %d" % i
+    if ckpt:
+        line += " CKPT %d" % len(ckpt)
+        for c in ckpt:
+            line += " %d" % c
     if drafter >= 0:
         line += " %d" % drafter
     line += "\n"
@@ -141,6 +153,11 @@ def main():
     ap.add_argument("--cut-generated", type=int, default=0,
                     help="an entry is prompt+generated; drop this many ids from the end "
                          "first (the API log's gen= field) to replay the prompt alone")
+    ap.add_argument("--tail", type=int, default=0,
+                    help="keep only the last N ids (after --cut-generated); 0 = all")
+    ap.add_argument("--ckpt", default="",
+                    help="comma-separated CKPT hint ids (the API sends "
+                         "<tool_call>,</think>); empty = none")
     ap.add_argument("--max-tokens", type=int, default=200)
     ap.add_argument("--drafter", type=int, default=-1,
                     help="-1 engine default, 0 serial, 3 ngram, 4 chain")
@@ -171,17 +188,20 @@ def main():
 
     if args.cut_generated:
         ids = ids[:len(ids) - args.cut_generated]
-    print("replaying %d ids, max_tokens %d, drafter %s, engine %s:%d"
-          % (len(ids), args.max_tokens, args.drafter, args.host, args.port))
+    if args.tail:
+        ids = ids[-args.tail:]
+    ckpt = [int(v) for v in args.ckpt.split(",") if v]
+    print("replaying %d ids, max_tokens %d, drafter %s, ckpt %s, engine %s:%d"
+          % (len(ids), args.max_tokens, args.drafter, ckpt or "-", args.host, args.port))
     print("prompt tail: %s" % describe(ids[-12:], special, inv, c2b))
 
     tokens, dline = generate(args.host, args.port, ids, args.max_tokens,
-                             args.drafter, args.timeout)
+                             args.drafter, args.timeout, ckpt)
     print("D line: %s" % dline)
     print("generated %d tokens" % len(tokens))
     print("ids:  %s" % " ".join(str(t) for t in tokens))
     print("desc: %s" % describe(tokens, special, inv, c2b))
-    print("text: %r" % decode_ids(tokens, special, inv))
+    print("text: %r" % decode_ids(tokens, special, inv, c2b))
 
 
 if __name__ == "__main__":

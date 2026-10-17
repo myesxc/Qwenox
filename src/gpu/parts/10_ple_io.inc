@@ -343,9 +343,14 @@ struct PleWin {
         const size_t need = direct ? skew[slot] + g_ple_rb : g_ple_rb;
         if (!pov || slot >= depth || pov->Internal != 0 || got < need) {
           fprintf(stderr,
-                  "ple_win: read completion failed (row=%zu, got=%lu, status=0x%lx)\n",
+                  "ple_win: read completion failed (row=%zu, got=%lu, status=0x%lx%s; "
+                  "batch [%p,%p))\n",
                   pov && slot < depth ? rows[slot] : (size_t)-1, (unsigned long)got,
-                  pov ? (unsigned long)pov->Internal : 0ul);
+                  pov ? (unsigned long)pov->Internal : 0ul,
+                  !pov                                        ? " null completion"
+                  : slot >= depth ? " completion from another batch"
+                                  : " short or failed read",
+                  (void*)ovs.data(), (void*)(ovs.data() + depth));
           abort();
         }
         if (direct)
@@ -365,6 +370,15 @@ struct PleWin {
   std::vector<OVERLAPPED> b_ovs;
   size_t b_n = 0;
   void issue(const uint64_t* addrs, uint8_t* staging, uint64_t table_va, size_t n) {
+    // One batch in flight at a time: a second issue() before the first was
+    // reaped would overwrite pending OVERLAPPEDs and strand the earlier
+    // batch's completions in the IOCP (fatal for the next run()).  Every
+    // caller pairs issue() with wait_all(), so this only fires on a
+    // regression.
+    if (b_n != 0) {
+      fprintf(stderr, "ple_win: issue() with %zu completions still unreaped\n", b_n);
+      abort();
+    }
     b_ovs.assign(n, OVERLAPPED{});  // never reallocated while reads are pending
     for (size_t i = 0; i < n; i++) {
       OVERLAPPED* ov = &b_ovs[i];
@@ -385,10 +399,19 @@ struct PleWin {
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
       BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
-      if (!okr || got != g_ple_rb) {
-        fprintf(stderr, "ple_win: read completion failed (row=%zd, got=%lu, err=%lu)\n",
-                pov ? (ptrdiff_t)(pov - b_ovs.data()) : (ptrdiff_t)-1, (unsigned long)got,
-                (unsigned long)GetLastError());
+      // The entry has to belong to this batch: counting a foreign OVERLAPPED
+      // here would strand one of ours in exchange (and is how the run()
+      // abort below gets triggered later).  Ownership is the address range.
+      const uintptr_t lo = (uintptr_t)b_ovs.data();
+      const uintptr_t hi = lo + b_n * sizeof(OVERLAPPED);
+      const bool mine = (uintptr_t)pov >= lo && (uintptr_t)pov < hi;
+      if (!okr || got != g_ple_rb || !mine) {
+        fprintf(stderr,
+                "ple_win: read completion failed (row=%zd, got=%lu, err=%lu)%s\n",
+                pov ? (ptrdiff_t)((uintptr_t)pov - lo) : (ptrdiff_t)-1,
+                (unsigned long)got, (unsigned long)GetLastError(),
+                mine ? "" : " [foreign OVERLAPPED: another flight's reads leaked"
+                            " into this IOCP]");
         abort();
       }
     }
